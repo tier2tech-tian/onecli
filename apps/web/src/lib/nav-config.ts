@@ -5,6 +5,7 @@ import {
   Settings,
   Plug,
   Activity,
+  Globe,
   User,
   KeyRound,
   ShieldCheck,
@@ -32,6 +33,10 @@ export const navItems: NavItem[] = [
 ];
 
 export const settingsSections: SettingsNavSection[] = [
+  {
+    label: "Instance",
+    items: [{ title: "General", url: "/settings/general", icon: Globe }],
+  },
   {
     label: "Account",
     items: [

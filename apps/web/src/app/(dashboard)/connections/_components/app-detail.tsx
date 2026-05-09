@@ -54,6 +54,7 @@ interface AppDetailProps {
   };
   hasEnvDefaults: boolean;
   hasAppConfig: boolean;
+  appUrl: string;
   getConnections?: typeof defaultGetConnections;
   checkAppConfig?: typeof defaultCheckConfig;
   pageScope?: "project" | "organization";
@@ -79,6 +80,7 @@ export const AppDetail = ({
   configurable,
   hasEnvDefaults,
   hasAppConfig,
+  appUrl,
   getConnections = defaultGetConnections_,
   checkAppConfig = defaultCheckConfig,
   pageScope = "project",
@@ -315,6 +317,7 @@ export const AppDetail = ({
           hasEnvDefaults={hasEnvDefaults}
           isConnected={isConnected}
           onConfigChange={refreshConfigStatus}
+          appUrl={appUrl}
         />
       )}
 

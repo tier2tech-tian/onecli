@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import { getApp } from "@onecli/api/apps/registry";
 import { checkAppConfigExists } from "@/lib/actions/app-config";
+import { getPublicUrl } from "@/lib/actions/project";
 import { AppDetail } from "../../_components/app-detail";
 
 interface Props {
@@ -28,6 +29,8 @@ export default async function AppDetailPage({ params }: Props) {
     // Auth may not be resolved; treat as false
   }
 
+  const appUrl = await getPublicUrl().catch(() => "http://localhost:10254");
+
   return (
     <AppDetail
       app={{
@@ -49,6 +52,7 @@ export default async function AppDetailPage({ params }: Props) {
       configurable={app.configurable}
       hasEnvDefaults={hasEnvDefaults}
       hasAppConfig={hasAppConfig}
+      appUrl={appUrl}
     />
   );
 }

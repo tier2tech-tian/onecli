@@ -81,6 +81,7 @@ model Project {
   slug               String?
   createdByUserId    String?  @map("created_by_user_id")
   createdByUserEmail String?  @map("created_by_user_email")
+  publicUrl          String?  @map("public_url")
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
 

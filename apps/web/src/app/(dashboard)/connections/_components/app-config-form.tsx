@@ -32,8 +32,7 @@ import {
   deleteAppConfigAction,
   setAppConfigEnabled,
 } from "@/lib/actions/app-config";
-import { APP_URL, IS_CLOUD } from "@/lib/env";
-import { API_ORIGIN } from "@/lib/api-fetch";
+import { IS_CLOUD } from "@/lib/env";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 
 interface AppConfigFormProps {
@@ -49,6 +48,7 @@ interface AppConfigFormProps {
   hint?: string;
   hasEnvDefaults: boolean;
   isConnected: boolean;
+  appUrl: string;
   /** Called after any config change that invalidates the connection (save, toggle, delete). */
   onConfigChange?: () => void;
 }
@@ -60,6 +60,7 @@ export const AppConfigForm = ({
   hint,
   hasEnvDefaults,
   isConnected,
+  appUrl,
   onConfigChange,
 }: AppConfigFormProps) => {
   const [values, setValues] = useState<Record<string, string>>({});
@@ -265,7 +266,7 @@ export const AppConfigForm = ({
               </div>
             ))}
 
-            <RedirectUri provider={provider} />
+            <RedirectUri provider={provider} appUrl={appUrl} />
 
             <div className="flex items-center gap-3">
               <Button
@@ -342,15 +343,29 @@ export const AppConfigForm = ({
   );
 };
 
-const RedirectUri = ({ provider }: { provider: string }) => {
-  const redirectUri = `${API_ORIGIN || APP_URL}/v1/apps/${provider}/callback`;
+const RedirectUri = ({
+  provider,
+  appUrl,
+}: {
+  provider: string;
+  appUrl: string;
+}) => {
+  const redirectUri = `${appUrl}/v1/apps/${provider}/callback`;
   const { copied, copy } = useCopyToClipboard();
 
   return (
     <div className="grid gap-1.5">
       <Label>Redirect URI</Label>
       <p className="text-xs text-muted-foreground">
-        Add this URL to your OAuth app&apos;s allowed redirect URIs.
+        Add this URL to your OAuth app&apos;s allowed redirect URIs. You can
+        change the base URL in{" "}
+        <a
+          href="/settings/general"
+          className="text-foreground font-medium underline underline-offset-2 transition-colors hover:text-foreground/80"
+        >
+          Settings
+        </a>
+        .
       </p>
       <div className="flex items-center gap-3">
         <div className="flex-1 rounded-md border bg-muted/50 px-3 py-2 font-mono text-sm text-foreground truncate">
