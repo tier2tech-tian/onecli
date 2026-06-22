@@ -2,7 +2,6 @@
 //! stream responses back, and intercept auth failures for unconnected apps.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use anyhow::{Context, Result};
@@ -81,19 +80,25 @@ const RETRY_BODY_LIMIT: u64 = 4 * 1024 * 1024;
 const ROTATION_CACHE_CAP: usize = 1024;
 
 /// Per (account_id, host) 的 rotation 计数器，进程级。
-static ROTATION_OFFSETS: LazyLock<Mutex<LruCache<(String, String), AtomicUsize>>> =
+/// 所有访问在 Mutex 锁内完成，普通 usize 即可。
+static ROTATION_OFFSETS: LazyLock<Mutex<LruCache<(String, String), usize>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(ROTATION_CACHE_CAP).unwrap())));
 
-/// 获取并递增 rotation offset。
+/// 获取并递增 rotation offset。Mutex poison 时恢复而非 panic。
 fn get_rotation_offset(account_id: &str, host: &str) -> usize {
     let key = (account_id.to_string(), host.to_string());
-    let mut cache = ROTATION_OFFSETS.lock().unwrap();
-    if let Some(counter) = cache.get(&key) {
-        return counter.fetch_add(1, Ordering::Relaxed);
-    }
-    // 新 entry，从 0 开始，返回 0 后递增到 1
-    cache.put(key, AtomicUsize::new(1));
-    0
+    let mut cache = ROTATION_OFFSETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let val = if let Some(v) = cache.get_mut(&key) {
+        let current = *v;
+        *v = current.wrapping_add(1);
+        current
+    } else {
+        cache.put(key, 1);
+        0
+    };
+    val
 }
 
 // ── Header filtering ────────────────────────────────────────────────────
@@ -227,13 +232,21 @@ pub(crate) async fn forward_request(
         }
     }
 
-    // 选择注入源
-    let rotation_offset = account_id
-        .map(|aid| get_rotation_offset(aid, host))
-        .unwrap_or(0);
-    let source = select_injection_source(secret_candidates, app_injection_rules, &path, rotation_offset);
+    // 选择注入源。rotation offset 延迟到确认 MultiSecret 后才递增，
+    // 避免 SingleSecret / AppFallback / None 请求扰动轮换分布。
+    let source = select_injection_source(secret_candidates, app_injection_rules, &path, 0);
+    let source = if matches!(&source, InjectionSource::MultiSecret { .. }) {
+        // 确认是 MultiSecret，递增 offset 后重新选择
+        let offset = account_id
+            .map(|aid| get_rotation_offset(aid, host))
+            .unwrap_or(0);
+        select_injection_source(secret_candidates, app_injection_rules, &path, offset)
+    } else {
+        source
+    };
 
-    // Content-Length gate：决定是否进入 buffer + retry 路径
+    // Content-Length gate：只有 CL 已知且超限时才跳过 retry。
+    // 无 CL（chunked transfer）也进 retry 路径，由 read_body_with_limit 兜底。
     let content_length: Option<u64> = parts
         .headers
         .get(CONTENT_LENGTH)
@@ -241,8 +254,8 @@ pub(crate) async fn forward_request(
         .and_then(|s| s.parse().ok());
 
     let can_retry = matches!(&source, InjectionSource::MultiSecret { .. });
-    let use_retry_path =
-        can_retry && content_length.is_some_and(|cl| cl <= RETRY_BODY_LIMIT);
+    let body_too_large = content_length.is_some_and(|cl| cl > RETRY_BODY_LIMIT);
+    let use_retry_path = can_retry && !body_too_large;
 
     // --- retry 路径：MultiSecret + CL <= 4MB ---
     if let (true, InjectionSource::MultiSecret { candidates, offset }) = (use_retry_path, &source) {
@@ -280,7 +293,10 @@ pub(crate) async fn forward_request(
 
             let status = upstream_resp.status();
 
-            // 仅 429 且还有下一个 candidate 时才轮换
+            // 仅 429 且还有下一个 candidate 时才轮换。
+            // upstream_resp 在 continue 时被 drop，reqwest 会关闭底层连接
+            // 而非复用（body 未 drain）。429 response body 通常很小，但批量
+            // 429 时会降低连接复用率。可接受：轮换成功后新连接会被池化。
             if status == StatusCode::TOO_MANY_REQUESTS && attempt < n - 1 {
                 warn!(
                     secret_id = %candidate.secret_id,
@@ -288,6 +304,7 @@ pub(crate) async fn forward_request(
                     total = n,
                     "upstream 429, rotating to next secret"
                 );
+                drop(upstream_resp);
                 continue;
             }
 
