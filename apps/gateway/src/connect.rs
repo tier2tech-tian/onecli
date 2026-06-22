@@ -20,11 +20,21 @@ const CACHE_TTL_SECS: u64 = 60;
 
 // ── Data types ──────────────────────────────────────────────────────────
 
+/// 一个 secret 对应一个候选项，携带 secret_id 元数据用于 429 轮换。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SecretCandidate {
+    pub secret_id: String,
+    pub rule: InjectionRule,
+}
+
 /// Result of policy resolution for a CONNECT request.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ConnectResponse {
     pub intercept: bool,
-    pub injection_rules: Vec<InjectionRule>,
+    /// secret 级注入候选（带 secret_id，参与 429 轮换）
+    pub secret_candidates: Vec<SecretCandidate>,
+    /// app connection / vault fallback 级注入规则（不参与轮换）
+    pub app_injection_rules: Vec<InjectionRule>,
     pub policy_rules: Vec<PolicyRule>,
     pub account_id: Option<String>,
 }
@@ -62,42 +72,46 @@ impl PolicyEngine {
         agent: &db::AgentRow,
         hostname: &str,
     ) -> Result<ConnectResponse, ConnectError> {
-        let injection_rules = self.resolve_injections(agent, hostname).await?;
+        let (secret_candidates, app_injection_rules) =
+            self.resolve_injections(agent, hostname).await?;
         let policy_rules = self.resolve_policy_rules(agent, hostname).await?;
-        let has_rules = !injection_rules.is_empty() || !policy_rules.is_empty();
+        let has_rules =
+            !secret_candidates.is_empty() || !app_injection_rules.is_empty() || !policy_rules.is_empty();
 
         Ok(ConnectResponse {
             intercept: has_rules,
-            injection_rules,
+            secret_candidates,
+            app_injection_rules,
             policy_rules,
             account_id: Some(agent.account_id.clone()),
         })
     }
 
-    /// Resolve all injection rules: secrets first, then app connections as fallback.
+    /// Resolve injection sources: secrets first, app connections as host-level fallback.
+    /// 保持现有 secret 优先语义：host 匹配到 secret 时不查 app connection。
     async fn resolve_injections(
         &self,
         agent: &db::AgentRow,
         hostname: &str,
-    ) -> Result<Vec<InjectionRule>, ConnectError> {
-        let secret_rules = self.resolve_secret_injections(agent, hostname).await?;
-        if !secret_rules.is_empty() {
-            debug!(host = %hostname, count = secret_rules.len(), "resolve: using secrets");
-            return Ok(secret_rules);
+    ) -> Result<(Vec<SecretCandidate>, Vec<InjectionRule>), ConnectError> {
+        let secret_candidates = self.resolve_secret_candidates(agent, hostname).await?;
+        if !secret_candidates.is_empty() {
+            debug!(host = %hostname, count = secret_candidates.len(), "resolve: using secrets");
+            return Ok((secret_candidates, vec![]));
         }
 
-        // Secrets take priority — only try app connections when no secret matched.
+        // Secrets take priority — only try app connections when no secret matched at host level.
         let app_rules = self.resolve_app_injections(agent, hostname).await?;
         debug!(host = %hostname, count = app_rules.len(), "resolve: using app connections");
-        Ok(app_rules)
+        Ok((vec![], app_rules))
     }
 
-    /// Build injection rules from secrets matching this host.
-    async fn resolve_secret_injections(
+    /// Build SecretCandidate list from secrets matching this host.
+    async fn resolve_secret_candidates(
         &self,
         agent: &db::AgentRow,
         hostname: &str,
-    ) -> Result<Vec<InjectionRule>, ConnectError> {
+    ) -> Result<Vec<SecretCandidate>, ConnectError> {
         let secrets = if agent.secret_mode == "selective" {
             db::find_secrets_by_agent(&self.pool, &agent.id).await
         } else {
@@ -110,7 +124,7 @@ impl PolicyEngine {
             .filter(|s| host_matches(hostname, &s.host_pattern))
             .collect();
 
-        let mut rules = Vec::with_capacity(matching.len());
+        let mut candidates = Vec::with_capacity(matching.len());
         for secret in &matching {
             let decrypted = self
                 .crypto
@@ -121,16 +135,19 @@ impl PolicyEngine {
             let injections =
                 build_injections(&secret.type_, &decrypted, secret.injection_config.as_ref());
 
-            rules.push(InjectionRule {
-                path_pattern: secret
-                    .path_pattern
-                    .clone()
-                    .unwrap_or_else(|| "*".to_string()),
-                injections,
+            candidates.push(SecretCandidate {
+                secret_id: secret.id.clone(),
+                rule: InjectionRule {
+                    path_pattern: secret
+                        .path_pattern
+                        .clone()
+                        .unwrap_or_else(|| "*".to_string()),
+                    injections,
+                },
             });
         }
 
-        Ok(rules)
+        Ok(candidates)
     }
 
     /// Build injection rules from app connections for this host.
@@ -507,7 +524,8 @@ mod tests {
         let store = new_store().await;
         let response = ConnectResponse {
             intercept: true,
-            injection_rules: vec![],
+            secret_candidates: vec![],
+            app_injection_rules: vec![],
             policy_rules: vec![],
             account_id: None,
         };
