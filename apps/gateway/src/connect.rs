@@ -75,8 +75,9 @@ impl PolicyEngine {
         let (secret_candidates, app_injection_rules) =
             self.resolve_injections(agent, hostname).await?;
         let policy_rules = self.resolve_policy_rules(agent, hostname).await?;
-        let has_rules =
-            !secret_candidates.is_empty() || !app_injection_rules.is_empty() || !policy_rules.is_empty();
+        let has_rules = !secret_candidates.is_empty()
+            || !app_injection_rules.is_empty()
+            || !policy_rules.is_empty();
 
         Ok(ConnectResponse {
             intercept: has_rules,

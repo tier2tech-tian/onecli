@@ -81,15 +81,16 @@ const ROTATION_CACHE_CAP: usize = 1024;
 
 /// Per (account_id, host) 的 rotation 计数器，进程级。
 /// 所有访问在 Mutex 锁内完成，普通 usize 即可。
-static ROTATION_OFFSETS: LazyLock<Mutex<LruCache<(String, String), usize>>> =
-    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(ROTATION_CACHE_CAP).unwrap())));
+static ROTATION_OFFSETS: LazyLock<Mutex<LruCache<(String, String), usize>>> = LazyLock::new(|| {
+    Mutex::new(LruCache::new(
+        NonZeroUsize::new(ROTATION_CACHE_CAP).unwrap(),
+    ))
+});
 
 /// 获取并递增 rotation offset。Mutex poison 时恢复而非 panic。
 fn get_rotation_offset(account_id: &str, host: &str) -> usize {
     let key = (account_id.to_string(), host.to_string());
-    let mut cache = ROTATION_OFFSETS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut cache = ROTATION_OFFSETS.lock().unwrap_or_else(|e| e.into_inner());
     let val = if let Some(v) = cache.get_mut(&key) {
         let current = *v;
         *v = current.wrapping_add(1);
@@ -245,8 +246,8 @@ pub(crate) async fn forward_request(
         source
     };
 
-    // Content-Length gate：只有 CL 已知且超限时才跳过 retry。
-    // 无 CL（chunked transfer）也进 retry 路径，由 read_body_with_limit 兜底。
+    // Content-Length gate：只有 CL 已知且超限时才跳过 retry（走单次流式转发）。
+    // 无 CL（chunked transfer）也进 retry 路径；若实际 body 超限，返回 413。
     let content_length: Option<u64> = parts
         .headers
         .get(CONTENT_LENGTH)
@@ -257,9 +258,35 @@ pub(crate) async fn forward_request(
     let body_too_large = content_length.is_some_and(|cl| cl > RETRY_BODY_LIMIT);
     let use_retry_path = can_retry && !body_too_large;
 
-    // --- retry 路径：MultiSecret + CL <= 4MB ---
+    // --- retry 路径：MultiSecret + body 可 buffer ---
+    // 无 CL 的 chunked 请求也进此路径；若 body 超过 RETRY_BODY_LIMIT，
+    // read_body_with_limit 会失败，返回 413 给客户端（body 已消费无法降级为流式）。
     if let (true, InjectionSource::MultiSecret { candidates, offset }) = (use_retry_path, &source) {
-        let body_bytes = read_body_with_limit(body, RETRY_BODY_LIMIT).await?;
+        let body_bytes = match read_body_with_limit(body, RETRY_BODY_LIMIT).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                warn!(
+                    url = %url,
+                    limit = RETRY_BODY_LIMIT,
+                    "request body exceeds retry buffer limit, returning 413"
+                );
+                let err_body = serde_json::json!({
+                    "error": "payload_too_large",
+                    "message": format!(
+                        "Request body exceeds {}MB retry buffer limit. \
+                         Reduce payload size or contact admin to adjust the limit.",
+                        RETRY_BODY_LIMIT / (1024 * 1024)
+                    ),
+                })
+                .to_string();
+                let mut response = Response::new(Either::Left(Full::new(Bytes::from(err_body))));
+                *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                response
+                    .headers_mut()
+                    .insert("content-type", "application/json".parse().unwrap());
+                return Ok(response);
+            }
+        };
         let n = candidates.len();
 
         for attempt in 0..n {
@@ -551,7 +578,10 @@ mod tests {
         ];
         let app_rules = vec![make_app_rule("*")];
         match select_injection_source(&candidates, &app_rules, "/v1/messages", 5) {
-            InjectionSource::MultiSecret { candidates: matched, offset } => {
+            InjectionSource::MultiSecret {
+                candidates: matched,
+                offset,
+            } => {
                 assert_eq!(matched.len(), 3);
                 assert_eq!(offset, 5 % 3); // 2
             }

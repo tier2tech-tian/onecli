@@ -441,29 +441,31 @@ async fn handle_http_proxy(
 
     let agent_token = inject::extract_agent_token(&req).filter(|t| !t.is_empty());
 
-    let (secret_candidates, mut app_injection_rules, policy_rules, account_id) =
-        if let Some(ref token) = agent_token {
-            match connect::resolve(token, &hostname, &state.policy_engine, &*state.cache).await {
-                Ok(resp) => (
-                    resp.secret_candidates,
-                    resp.app_injection_rules,
-                    resp.policy_rules,
-                    resp.account_id,
-                ),
-                Err(ConnectError::InvalidToken) => {
-                    warn!(peer = %peer_addr, host = %authority, "HTTP proxy rejected: invalid agent token");
-                    return Ok(response::proxy_auth_required());
-                }
-                Err(ConnectError::Internal(e)) => {
-                    warn!(peer = %peer_addr, host = %authority, error = %e, "HTTP proxy rejected: internal error");
-                    let mut resp = Response::new(axum::body::Body::empty());
-                    *resp.status_mut() = StatusCode::BAD_GATEWAY;
-                    return Ok(resp);
-                }
+    let (secret_candidates, mut app_injection_rules, policy_rules, account_id) = if let Some(
+        ref token,
+    ) = agent_token
+    {
+        match connect::resolve(token, &hostname, &state.policy_engine, &*state.cache).await {
+            Ok(resp) => (
+                resp.secret_candidates,
+                resp.app_injection_rules,
+                resp.policy_rules,
+                resp.account_id,
+            ),
+            Err(ConnectError::InvalidToken) => {
+                warn!(peer = %peer_addr, host = %authority, "HTTP proxy rejected: invalid agent token");
+                return Ok(response::proxy_auth_required());
             }
-        } else {
-            (vec![], vec![], vec![], None)
-        };
+            Err(ConnectError::Internal(e)) => {
+                warn!(peer = %peer_addr, host = %authority, error = %e, "HTTP proxy rejected: internal error");
+                let mut resp = Response::new(axum::body::Body::empty());
+                *resp.status_mut() = StatusCode::BAD_GATEWAY;
+                return Ok(resp);
+            }
+        }
+    } else {
+        (vec![], vec![], vec![], None)
+    };
 
     // Vault fallback — 归入 app_injection_rules，不参与 429 轮换
     if secret_candidates.is_empty() && app_injection_rules.is_empty() {
