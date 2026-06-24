@@ -355,6 +355,14 @@ pub(crate) async fn forward_request(
     // ── Consume request (both ManualApproval and Allow) ────────────
     let (parts, body) = req.into_parts();
 
+    // Capture original Content-Length BEFORE header filtering strips it.
+    // Used by the MultiSecret retry path to decide buffer vs single-shot.
+    let original_content_length: Option<u64> = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
     let mut headers = hyper::HeaderMap::new();
     for (name, value) in parts.headers.iter() {
         if is_forwarded_request_header(name) {
@@ -679,13 +687,9 @@ pub(crate) async fn forward_request(
     // ── Forward to upstream (with optional 429 rotation) ─────────────
     let (upstream_resp, status, resp_headers, injection_count) = match injection_source {
         InjectionSource::MultiSecret { candidates, offset } => {
-            // Check if body is bufferable for retry. Content-Length > 4MB → single-shot.
-            let content_length: Option<u64> = headers
-                .get(hyper::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse().ok());
-
-            let can_buffer = content_length.map_or(true, |cl| cl <= RETRY_BODY_LIMIT);
+            // Use original_content_length (captured before header filtering strips it).
+            // CL > 4MB → single-shot stream, no retry.
+            let can_buffer = original_content_length.map_or(true, |cl| cl <= RETRY_BODY_LIMIT);
 
             if !can_buffer {
                 // Body too large for retry — fall through to single-shot with first candidate.
@@ -716,17 +720,11 @@ pub(crate) async fn forward_request(
                 let rh = resp.headers().clone();
                 (resp, st, rh, real_count)
             } else {
-                // Buffer the body for potential retry.
-                // Buffer the full request body for retry. reqwest::Body implements
-                // http_body::Body, so BodyExt::collect() drains all frames.
-                let body_bytes = {
-                    let collected = BodyExt::collect(forward_body)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("buffering request body for 429 retry: {e}"))?
-                        .to_bytes();
-
-                    if content_length.is_none() && collected.len() as u64 > RETRY_BODY_LIMIT {
-                        // Chunked body exceeded limit during read → 413
+                // Buffer the body with a hard limit. Reads frame-by-frame
+                // and stops as soon as the cumulative size exceeds 4MB.
+                let body_bytes = match read_body_with_limit(forward_body, RETRY_BODY_LIMIT).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
                         return Ok(response::json(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             serde_json::json!({
@@ -735,7 +733,6 @@ pub(crate) async fn forward_request(
                             }),
                         ));
                     }
-                    collected
                 };
 
                 let n = candidates.len();
@@ -1098,6 +1095,26 @@ async fn apply_finalizer(
         }
         None => Ok(body),
     }
+}
+
+/// Read a request body frame-by-frame with a hard byte limit.
+/// Returns an error as soon as the cumulative size exceeds `limit`,
+/// without buffering the entire body first.
+async fn read_body_with_limit(body: reqwest::Body, limit: u64) -> Result<Bytes> {
+    use futures_util::StreamExt;
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow::anyhow!("reading request body: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        if buf.len() as u64 > limit {
+            return Err(anyhow::anyhow!(
+                "request body exceeds {}MB limit",
+                limit / (1024 * 1024)
+            ));
+        }
+    }
+    Ok(Bytes::from(buf))
 }
 
 fn emit_policy_telemetry(
