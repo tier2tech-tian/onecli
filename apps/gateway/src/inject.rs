@@ -25,8 +25,7 @@ pub(crate) enum Injection {
         value: String,
     },
     /// Replace a header only if it already exists in the request.
-    /// Used for OAuth: replace Authorization when the SDK sends the exchange
-    /// request, but leave x-api-key untouched on subsequent requests.
+    /// Useful when the caller must opt-in by sending the header first.
     ReplaceHeader {
         name: String,
         value: String,
@@ -978,5 +977,58 @@ mod tests {
         assert_eq!(count, 2);
         assert!(path.contains("api_key=sk-123"));
         assert_eq!(headers.get("x-custom").unwrap(), "value");
+    }
+
+    // ── OAuth injection integration tests ──────────────────────────────
+
+    #[test]
+    fn apply_injections_anthropic_oauth_replaces_placeholder_key() {
+        // SDK sends only x-api-key placeholder, no Authorization header.
+        // OAuth injection must SET Authorization and REMOVE x-api-key.
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("placeholder"));
+
+        let rules = vec![make_rule(
+            "*",
+            vec![
+                set_header("authorization", "Bearer sk-ant-oat-token"),
+                remove_header("x-api-key"),
+            ],
+        )];
+
+        let count = apply_injections(&mut headers, &mut "/v1/messages".to_string(), &rules);
+        assert_eq!(count, 2);
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer sk-ant-oat-token"
+        );
+        assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn apply_injections_anthropic_oauth_overwrites_existing_authorization() {
+        // If a request already carries an Authorization header, SetHeader
+        // must overwrite it with the OAuth token.
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer old-token"),
+        );
+
+        let rules = vec![make_rule(
+            "*",
+            vec![
+                set_header("authorization", "Bearer sk-ant-oat-new"),
+                remove_header("x-api-key"),
+            ],
+        )];
+
+        let count = apply_injections(&mut headers, &mut "/v1/messages".to_string(), &rules);
+        // SetHeader applied (overwrite), RemoveHeader skipped (no x-api-key)
+        assert_eq!(count, 1);
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer sk-ant-oat-new"
+        );
     }
 }
