@@ -64,6 +64,9 @@ uuid = { version = "1", features = ["v4"] }
 # Stream combinators
 futures-util = "0.3"
 
+# LRU cache (429 rotation offset)
+lru = "0.12"
+
 # Error handling
 anyhow = "1"
 
