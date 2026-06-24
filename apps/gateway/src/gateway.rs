@@ -865,6 +865,7 @@ async fn handle_http_proxy(
         claim_token: resolved.claim_token,
         session_policy: resolved_session_policy,
         budget_bindings: resolved.budget_bindings,
+        secret_candidates: resolved.secret_candidates,
     };
 
     let http_client =

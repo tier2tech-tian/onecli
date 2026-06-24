@@ -29,6 +29,13 @@ pub(crate) const SECRET_MODE_SELECTIVE: &str = "selective";
 
 // ── Data types ──────────────────────────────────────────────────────────
 
+/// A single secret candidate for 429 rotation, carrying secret_id metadata.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SecretCandidate {
+    pub secret_id: String,
+    pub rule: InjectionRule,
+}
+
 /// Result of policy resolution for a CONNECT request.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ConnectResponse {
@@ -61,6 +68,11 @@ pub(crate) struct ConnectResponse {
     /// host (0/1 in practice — the response is per-host). Empty in OSS.
     #[serde(default)]
     pub budget_bindings: Vec<crate::budget::BudgetBinding>,
+    /// Per-secret injection candidates for 429 rotation. Each entry pairs a
+    /// secret_id with its injection rule so the forwarding layer can rotate
+    /// to the next candidate on upstream 429. Empty when no secrets match.
+    #[serde(default)]
+    pub secret_candidates: Vec<SecretCandidate>,
 }
 
 /// Result of per-request app connection resolution.
@@ -193,7 +205,7 @@ impl PolicyEngine {
         agent: &db::AgentRow,
         hostname: &str,
     ) -> Result<ConnectResponse, ConnectError> {
-        let (injection_rules, _has_platform, budget_bindings) =
+        let (injection_rules, _has_platform, budget_bindings, secret_candidates) =
             self.resolve_secret_injections(agent, hostname).await?;
         let app_connections = self.resolve_app_connections(agent, hostname).await?;
         let policy_rules = self.resolve_policy_rules(agent, hostname).await?;
@@ -233,16 +245,17 @@ impl PolicyEngine {
             policy_mode: agent.policy_mode.clone(),
             claim_token,
             budget_bindings,
+            secret_candidates,
         })
     }
 
     /// Build injection rules from secrets matching this host.
-    /// Returns `(rules, has_platform_secret)`.
+    /// Returns `(rules, has_platform_secret, budget_bindings, secret_candidates)`.
     async fn resolve_secret_injections(
         &self,
         agent: &db::AgentRow,
         hostname: &str,
-    ) -> Result<(Vec<InjectionRule>, bool, Vec<crate::budget::BudgetBinding>), ConnectError> {
+    ) -> Result<(Vec<InjectionRule>, bool, Vec<crate::budget::BudgetBinding>, Vec<SecretCandidate>), ConnectError> {
         let secrets = if agent.secret_mode == SECRET_MODE_SELECTIVE {
             // Selective: agent_secrets join returns both project + org assigned secrets
             db::find_secrets_by_agent(&self.pool, &agent.id)
@@ -286,6 +299,7 @@ impl PolicyEngine {
         let has_platform = matching.iter().any(|s| s.is_platform);
 
         let mut rules = Vec::with_capacity(matching.len());
+        let mut secret_candidates = Vec::with_capacity(matching.len());
         for secret in &matching {
             // Resolve the value from its source (inline column or live 1Password
             // reference); a failure skips the secret, exactly as a decrypt
@@ -328,13 +342,20 @@ impl PolicyEngine {
                 secret.metadata.as_ref(),
             );
 
-            rules.push(InjectionRule {
+            let rule = InjectionRule {
                 path_pattern: secret
                     .path_pattern
                     .clone()
                     .unwrap_or_else(|| "*".to_string()),
                 injections,
+            };
+
+            secret_candidates.push(SecretCandidate {
+                secret_id: secret.id.clone(),
+                rule: rule.clone(),
             });
+
+            rules.push(rule);
         }
 
         // Cloud-only: resolve spend budgets for the effective partner credential
@@ -343,7 +364,7 @@ impl PolicyEngine {
         let budget_bindings =
             crate::budget::resolve_bindings(&self.pool, &agent.organization_id, &matching).await;
 
-        Ok((rules, has_platform, budget_bindings))
+        Ok((rules, has_platform, budget_bindings, secret_candidates))
     }
 
     /// Produce a secret's plaintext value from its source — the encrypted column
@@ -1263,6 +1284,7 @@ mod tests {
             policy_mode: "allow".to_string(),
             claim_token: None,
             budget_bindings: vec![],
+            secret_candidates: vec![],
         };
 
         store
@@ -1309,6 +1331,7 @@ mod tests {
             policy_mode: "allow".to_string(),
             claim_token: None,
             budget_bindings: vec![],
+            secret_candidates: vec![],
         };
 
         // Pre-populate cache with the key format that resolve() uses
@@ -1351,6 +1374,7 @@ mod tests {
             policy_mode: "allow".to_string(),
             claim_token: None,
             budget_bindings: vec![],
+            secret_candidates: vec![],
         };
 
         store

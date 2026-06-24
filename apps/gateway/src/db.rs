@@ -255,7 +255,7 @@ pub(crate) async fn find_secrets_by_project(
     project_id: &str,
 ) -> Result<Vec<SecretRow>> {
     sqlx::query_as::<_, SecretRow>(
-        r#"SELECT id, scope, type, value_source, encrypted_value, op_ref, host_pattern, path_pattern, injection_config, is_platform, metadata FROM secrets WHERE project_id = $1"#,
+        r#"SELECT id, scope, type, value_source, encrypted_value, op_ref, host_pattern, path_pattern, injection_config, is_platform, metadata FROM secrets WHERE project_id = $1 ORDER BY id ASC"#,
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -269,7 +269,8 @@ pub(crate) async fn find_secrets_by_agent(pool: &PgPool, agent_id: &str) -> Resu
         r#"SELECT s.id, s.scope, s.type, s.value_source, s.encrypted_value, s.op_ref, s.host_pattern, s.path_pattern, s.injection_config, s.is_platform, s.metadata
            FROM secrets s
            INNER JOIN agent_secrets as_ ON s.id = as_.secret_id
-           WHERE as_.agent_id = $1"#,
+           WHERE as_.agent_id = $1
+           ORDER BY s.id ASC"#,
     )
     .bind(agent_id)
     .fetch_all(pool)
@@ -285,7 +286,8 @@ pub(crate) async fn find_secrets_by_org(
     sqlx::query_as::<_, SecretRow>(
         r#"SELECT id, scope, type, value_source, encrypted_value, op_ref, host_pattern, path_pattern, injection_config, is_platform, metadata
            FROM secrets
-           WHERE organization_id = $1 AND scope = 'organization'"#,
+           WHERE organization_id = $1 AND scope = 'organization'
+           ORDER BY id ASC"#,
     )
     .bind(organization_id)
     .fetch_all(pool)

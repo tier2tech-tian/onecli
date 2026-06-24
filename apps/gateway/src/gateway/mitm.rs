@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use crate::approval::ApprovalStore;
 use crate::ca::CertificateAuthority;
 use crate::cache::CacheStore;
-use crate::connect::{self, AppConnectionResult, ConnectionChoice, PolicyEngine};
+use crate::connect::{self, AppConnectionResult, ConnectionChoice, PolicyEngine, SecretCandidate};
 use crate::db;
 use crate::inject::InjectionRule;
 
@@ -222,6 +222,9 @@ pub(crate) struct ResolvedRules {
     /// (0/1 in practice). Empty in OSS.
     #[cfg_attr(not(feature = "cloud"), allow(dead_code))]
     pub budget_bindings: Vec<crate::budget::BudgetBinding>,
+    /// Secret candidates for 429 rotation. Non-empty only when the injection
+    /// rules come from DB secrets (not app connections or vault fallback).
+    pub secret_candidates: Vec<SecretCandidate>,
 }
 
 /// Result of per-request rule resolution including app connection disambiguation.
@@ -281,6 +284,9 @@ async fn resolve_rules(
     .await?;
 
     let mut injection_rules = resp.injection_rules; // from secrets
+    // Secret candidates for 429 rotation — populated only when rules come
+    // from DB secrets; cleared when app connection or vault fallback wins.
+    let mut secret_candidates = resp.secret_candidates;
     let mut token_expires_at: Option<i64> = None;
     let mut rewrite_host: Option<String> = None;
     let mut connection_label: Option<String> = None;
@@ -314,6 +320,8 @@ async fn resolve_rules(
                 ..
             } => {
                 injection_rules = rules;
+                // App connection injection — secrets don't participate in rotation.
+                secret_candidates = vec![];
                 token_expires_at = exp;
                 rewrite_host = rh;
                 connection_label = cl;
@@ -337,9 +345,10 @@ async fn resolve_rules(
         }
     }
 
-    // Vault fallback
+    // Vault fallback — secrets don't participate in rotation.
     if injection_rules.is_empty() && !vault_rules.is_empty() {
         injection_rules = vault_rules.to_vec();
+        secret_candidates = vec![];
     }
 
     // Build intercept token only for providers that have intercept rules
@@ -390,6 +399,7 @@ async fn resolve_rules(
             claim_token: resp.claim_token,
             session_policy,
             budget_bindings: resp.budget_bindings,
+            secret_candidates,
         }),
         app_connections: resp.app_connections,
     })

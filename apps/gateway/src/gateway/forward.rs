@@ -2,6 +2,8 @@
 //! stream responses back, and intercept auth failures for unconnected apps.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::{LazyLock, Mutex};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,13 +13,15 @@ use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Bytes, Frame, Incoming};
 use hyper::header::HeaderName;
 use hyper::{Request, Response, StatusCode};
-use tracing::{info, warn};
+use lru::LruCache;
+use tracing::{debug, info, warn};
 
 use crate::approval::{
     ApprovalDecision, ApprovalGuard, ApprovalStore, PendingApproval, APPROVAL_TIMEOUT_SECS,
 };
 use crate::apps;
 use crate::cache::CacheStore;
+use crate::connect::SecretCandidate;
 use crate::default_interceptions;
 use crate::inject;
 use crate::policy::{self, PolicyDecision};
@@ -101,6 +105,81 @@ const AUTH_CHECK_BODY_LIMIT: usize = 8192;
 /// Maximum request body we'll buffer to evaluate a default interception.
 /// OAuth refresh bodies are tiny; this only guards against pathological inputs.
 const MAX_DEFAULT_INTERCEPT_BODY: usize = 64 * 1024;
+
+/// Maximum request body size eligible for 429 retry buffering (4 MB).
+const RETRY_BODY_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// Number of (account_id, host) rotation offsets to keep in memory.
+const ROTATION_CACHE_CAP: usize = 1024;
+
+/// Process-level LRU cache of rotation offsets keyed by (account_id, host).
+/// Each get-and-increment advances the offset so consecutive requests to the
+/// same host round-robin through available secret candidates.
+static ROTATION_OFFSETS: LazyLock<Mutex<LruCache<(String, String), usize>>> = LazyLock::new(|| {
+    Mutex::new(LruCache::new(NonZeroUsize::new(ROTATION_CACHE_CAP).unwrap()))
+});
+
+/// Injection source selection result for 429 rotation.
+#[derive(Debug)]
+enum InjectionSource<'a> {
+    /// Multiple secrets match the request path — supports 429 rotation retry.
+    MultiSecret {
+        candidates: Vec<&'a SecretCandidate>,
+        offset: usize,
+    },
+    /// Exactly one secret matches — single-shot, no rotation possible.
+    SingleSecret { candidate: &'a SecretCandidate },
+    /// No secret candidates — use existing injection_rules (app/vault).
+    Fallback,
+}
+
+/// Get the current rotation offset for an (account_id, host) pair and advance
+/// it for the next caller. Returns 0 on the first call for a given key.
+fn get_rotation_offset(account_id: &str, host: &str) -> usize {
+    let key = (account_id.to_string(), host.to_string());
+    let mut cache = ROTATION_OFFSETS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = cache.get_mut(&key) {
+        let current = *v;
+        *v = current.wrapping_add(1);
+        current
+    } else {
+        cache.put(key, 1);
+        0
+    }
+}
+
+/// Select the injection source for a request based on secret candidates and
+/// the request path. Only candidates whose path_pattern matches the request
+/// path are considered for rotation.
+fn select_injection_source<'a>(
+    candidates: &'a [SecretCandidate],
+    request_path: &str,
+    account_id: &str,
+    host: &str,
+) -> InjectionSource<'a> {
+    if candidates.is_empty() {
+        return InjectionSource::Fallback;
+    }
+
+    let matching: Vec<&'a SecretCandidate> = candidates
+        .iter()
+        .filter(|c| inject::path_matches(request_path, &c.rule.path_pattern))
+        .collect();
+
+    match matching.len() {
+        0 => InjectionSource::Fallback,
+        1 => InjectionSource::SingleSecret {
+            candidate: matching[0],
+        },
+        _ => {
+            let offset = get_rotation_offset(account_id, host);
+            InjectionSource::MultiSecret {
+                candidates: matching,
+                offset,
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_request(
@@ -300,11 +379,30 @@ pub(crate) async fn forward_request(
 
     hooks::prepare_request(rules, host, &path, &mut headers);
 
+    // Determine injection source for potential 429 rotation. The decision is
+    // made BEFORE apply_injections so the rotation path can apply per-candidate
+    // rules independently.
+    let account_id = proxy_ctx.agent_id.as_deref().unwrap_or("");
+    let injection_source = select_injection_source(
+        &rules.secret_candidates,
+        &path,
+        account_id,
+        host,
+    );
+
     // Apply injection rules — upstream_path may gain query-param secrets;
     // the original `path`/`url` stays clean for logging and approval metadata.
     let mut upstream_path = path.clone();
-    let injection_count =
-        inject::apply_injections(&mut headers, &mut upstream_path, &rules.injection_rules);
+    let injection_count = match &injection_source {
+        InjectionSource::MultiSecret { .. } => {
+            // Defer injection to the rotation loop — apply nothing here.
+            // We still count as "has injections" for pre_forward checks.
+            rules.injection_rules.len()
+        }
+        _ => {
+            inject::apply_injections(&mut headers, &mut upstream_path, &rules.injection_rules)
+        }
+    };
     let upstream_url = format!("{scheme}://{host}{upstream_path}");
 
     if let Some(resp) = hooks::pre_forward(
@@ -596,20 +694,151 @@ pub(crate) async fn forward_request(
         None => forward_body,
     };
 
-    // ── Forward to upstream ──────────────────────────────────────────
-    let mut upstream = http_client.request(method.clone(), &upstream_url);
-    for (name, value) in headers.iter() {
-        upstream = upstream.header(name.clone(), value.clone());
-    }
-    upstream = upstream.body(forward_body);
+    // ── Forward to upstream (with optional 429 rotation) ─────────────
+    let (upstream_resp, status, resp_headers, injection_count) = match injection_source {
+        InjectionSource::MultiSecret { candidates, offset } => {
+            // Check if body is bufferable for retry. Content-Length > 4MB → single-shot.
+            let content_length: Option<u64> = headers
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
 
-    let upstream_resp = upstream
-        .send()
-        .await
-        .with_context(|| format!("forwarding to {url}"))?;
+            let can_buffer = content_length.map_or(true, |cl| cl <= RETRY_BODY_LIMIT);
 
-    let status = upstream_resp.status();
-    let resp_headers = upstream_resp.headers().clone();
+            if !can_buffer {
+                // Body too large for retry — fall through to single-shot with first candidate.
+                let idx = offset % candidates.len();
+                let candidate = candidates[idx];
+                let mut retry_headers = headers.clone();
+                let mut retry_path = path.clone();
+                let real_count = inject::apply_injections(
+                    &mut retry_headers,
+                    &mut retry_path,
+                    &[candidate.rule.clone()],
+                );
+                let retry_url = format!("{scheme}://{host}{retry_path}");
+                let mut req_builder = http_client.request(method.clone(), &retry_url);
+                for (name, value) in retry_headers.iter() {
+                    req_builder = req_builder.header(name.clone(), value.clone());
+                }
+                req_builder = req_builder.body(forward_body);
+                let resp = req_builder
+                    .send()
+                    .await
+                    .with_context(|| format!("forwarding to {url}"))?;
+                let st = resp.status();
+                let rh = resp.headers().clone();
+                (resp, st, rh, real_count)
+            } else {
+                // Buffer the body for potential retry.
+                // Buffer the full request body for retry. reqwest::Body implements
+                // http_body::Body, so BodyExt::collect() drains all frames.
+                let body_bytes = {
+                    let collected = BodyExt::collect(forward_body)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("buffering request body for 429 retry: {e}"))?
+                        .to_bytes();
+
+                    if content_length.is_none() && collected.len() as u64 > RETRY_BODY_LIMIT {
+                        // Chunked body exceeded limit during read → 413
+                        return Ok(response::json(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            serde_json::json!({
+                                "error": "request_too_large",
+                                "message": "Request body exceeds 4MB retry limit"
+                            }),
+                        ));
+                    }
+                    collected
+                };
+
+                let n = candidates.len();
+                let mut last_resp = None;
+                let mut last_status = StatusCode::OK;
+                let mut last_headers = hyper::HeaderMap::new();
+                let mut real_injection_count = 0;
+
+                for i in 0..n {
+                    let idx = (offset + i) % n;
+                    let candidate = candidates[idx];
+
+                    let mut retry_headers = headers.clone();
+                    let mut retry_path = path.clone();
+                    real_injection_count = inject::apply_injections(
+                        &mut retry_headers,
+                        &mut retry_path,
+                        &[candidate.rule.clone()],
+                    );
+                    let retry_url = format!("{scheme}://{host}{retry_path}");
+
+                    let mut req_builder = http_client.request(method.clone(), &retry_url);
+                    for (name, value) in retry_headers.iter() {
+                        req_builder = req_builder.header(name.clone(), value.clone());
+                    }
+                    req_builder = req_builder.body(reqwest::Body::from(body_bytes.clone()));
+
+                    let resp = req_builder
+                        .send()
+                        .await
+                        .with_context(|| format!("forwarding to {url} (rotation attempt {i})"))?;
+
+                    let st = resp.status();
+                    let rh = resp.headers().clone();
+
+                    // If NOT 429, or this is the last candidate, return this response.
+                    if st != StatusCode::TOO_MANY_REQUESTS || i == n - 1 {
+                        if st == StatusCode::TOO_MANY_REQUESTS && i > 0 {
+                            debug!(
+                                secret_id = %candidate.secret_id,
+                                attempt = i + 1,
+                                total = n,
+                                "all rotation candidates exhausted with 429"
+                            );
+                        } else if i > 0 {
+                            debug!(
+                                secret_id = %candidate.secret_id,
+                                attempt = i + 1,
+                                total = n,
+                                status = %st.as_u16(),
+                                "rotation succeeded after 429"
+                            );
+                        }
+                        last_resp = Some(resp);
+                        last_status = st;
+                        last_headers = rh;
+                        break;
+                    }
+
+                    // Got 429 with more candidates — rotate.
+                    debug!(
+                        secret_id = %candidate.secret_id,
+                        attempt = i + 1,
+                        total = n,
+                        "upstream 429 — rotating to next secret candidate"
+                    );
+                    // Consume and discard the 429 response body so the connection is freed.
+                    let _ = resp.bytes().await;
+                }
+
+                (last_resp.unwrap(), last_status, last_headers, real_injection_count)
+            }
+        }
+        _ => {
+            // SingleSecret or Fallback — normal single-shot path.
+            let mut req_builder = http_client.request(method.clone(), &upstream_url);
+            for (name, value) in headers.iter() {
+                req_builder = req_builder.header(name.clone(), value.clone());
+            }
+            req_builder = req_builder.body(forward_body);
+            let resp = req_builder
+                .send()
+                .await
+                .with_context(|| format!("forwarding to {url}"))?;
+            let st = resp.status();
+            let rh = resp.headers().clone();
+            (resp, st, rh, injection_count)
+        }
+    };
 
     // Response hints: intercept known-deprecated host error responses.
     if proxy_ctx.agent_token.is_some() {
@@ -1109,5 +1338,113 @@ mod tests {
         // Invalid UTF-8 prefix + "api key"
         let body = &[0xFF, 0xFE, 0x61, 0x70, 0x69, 0x20, 0x6B, 0x65, 0x79];
         assert!(body_indicates_auth_error(body));
+    }
+
+    // ── select_injection_source ─────────────────────────────────────────
+
+    fn make_candidate(secret_id: &str, path_pattern: &str) -> SecretCandidate {
+        SecretCandidate {
+            secret_id: secret_id.to_string(),
+            rule: inject::InjectionRule {
+                path_pattern: path_pattern.to_string(),
+                injections: vec![inject::Injection::SetHeader {
+                    name: "x-api-key".to_string(),
+                    value: format!("key-{secret_id}"),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn injection_source_multi_secret() {
+        let candidates = vec![
+            make_candidate("s1", "*"),
+            make_candidate("s2", "*"),
+            make_candidate("s3", "*"),
+        ];
+        let source = select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+        match source {
+            InjectionSource::MultiSecret { candidates: matched, .. } => {
+                assert_eq!(matched.len(), 3);
+            }
+            _ => panic!("expected MultiSecret"),
+        }
+    }
+
+    #[test]
+    fn injection_source_single_secret_by_path_filter() {
+        let candidates = vec![
+            make_candidate("s1", "/v1/*"),
+            make_candidate("s2", "/v2/*"),
+        ];
+        let source = select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+        match source {
+            InjectionSource::SingleSecret { candidate } => {
+                assert_eq!(candidate.secret_id, "s1");
+            }
+            _ => panic!("expected SingleSecret, got {:?}", source),
+        }
+    }
+
+    #[test]
+    fn injection_source_fallback_no_candidates() {
+        let source = select_injection_source(&[], "/v1/messages", "acct_1", "api.example.com");
+        assert!(matches!(source, InjectionSource::Fallback));
+    }
+
+    #[test]
+    fn injection_source_fallback_path_mismatch() {
+        let candidates = vec![
+            make_candidate("s1", "/v2/*"),
+            make_candidate("s2", "/v3/*"),
+        ];
+        let source = select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+        assert!(matches!(source, InjectionSource::Fallback));
+    }
+
+    #[test]
+    fn injection_source_single_all_match_same_path() {
+        // Two candidates but only one matches the specific path.
+        let candidates = vec![
+            make_candidate("s1", "/v1/messages"),
+            make_candidate("s2", "/v1/completions"),
+        ];
+        let source = select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+        match source {
+            InjectionSource::SingleSecret { candidate } => {
+                assert_eq!(candidate.secret_id, "s1");
+            }
+            _ => panic!("expected SingleSecret"),
+        }
+    }
+
+    #[test]
+    fn injection_source_multi_offset_wraps() {
+        let candidates = vec![
+            make_candidate("s1", "*"),
+            make_candidate("s2", "*"),
+        ];
+        // Call multiple times to test offset advancement and wrapping.
+        // Each call advances the global offset, but we only verify the
+        // returned variant is MultiSecret with correct candidate count.
+        for _ in 0..5 {
+            let source = select_injection_source(&candidates, "/v1/x", "acct_wrap", "host.wrap");
+            match source {
+                InjectionSource::MultiSecret { candidates: matched, .. } => {
+                    assert_eq!(matched.len(), 2);
+                }
+                _ => panic!("expected MultiSecret"),
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_offset_advances() {
+        // Verify the offset increments on each call for the same key.
+        let o1 = get_rotation_offset("acct_test_adv", "host_test_adv");
+        let o2 = get_rotation_offset("acct_test_adv", "host_test_adv");
+        let o3 = get_rotation_offset("acct_test_adv", "host_test_adv");
+        assert_eq!(o1 + 1, o2);
+        assert_eq!(o2 + 1, o3);
     }
 }
