@@ -695,6 +695,7 @@ async fn handle_connect(
                             proxy_ctx,
                             approval_store,
                             Arc::clone(&state.policy_engine),
+                            skip_verify,
                         )
                         .await
                     } else {
