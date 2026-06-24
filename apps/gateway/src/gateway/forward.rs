@@ -128,6 +128,7 @@ enum InjectionSource<'a> {
         offset: usize,
     },
     /// Exactly one secret matches — single-shot, no rotation possible.
+    #[allow(dead_code)] // candidate metadata available for logging, not used for injection
     SingleSecret { candidate: &'a SecretCandidate },
     /// No secret candidates — use existing injection_rules (app/vault).
     Fallback,
@@ -666,32 +667,13 @@ pub(crate) async fn forward_request(
     let forward_body = hooks::prepare_request_body(rules, host, forward_body).await;
 
     // ── Provider-specific request signing ─────────────────────────
-    let forward_body = match rules
-        .finalizer
-        .or_else(|| crate::apps::finalizer_for_host(host.split(':').next().unwrap_or(host)))
-    {
-        Some(crate::apps::RequestFinalizer::AwsSigV4) => {
-            super::finalizers::aws_sigv4::finalize_request(
-                host,
-                method.as_str(),
-                &upstream_path,
-                &mut headers,
-                forward_body,
-            )
+    // For MultiSecret, defer signing to the retry loop so each attempt gets
+    // a signature computed with the correct (per-candidate) headers and path.
+    let forward_body = if matches!(&injection_source, InjectionSource::MultiSecret { .. }) {
+        forward_body
+    } else {
+        apply_finalizer(rules, host, method.as_str(), &upstream_path, &mut headers, forward_body)
             .await?
-        }
-        #[cfg(feature = "cloud")]
-        Some(crate::apps::RequestFinalizer::AwsAssumeRole) => {
-            super::finalizers::aws_sts::finalize_request(
-                host,
-                method.as_str(),
-                &upstream_path,
-                &mut headers,
-                forward_body,
-            )
-            .await?
-        }
-        None => forward_body,
     };
 
     // ── Forward to upstream (with optional 429 rotation) ─────────────
@@ -716,12 +698,16 @@ pub(crate) async fn forward_request(
                     &mut retry_path,
                     &[candidate.rule.clone()],
                 );
+                // Sign AFTER injection so path/headers include candidate credentials.
+                let finalized_body = apply_finalizer(
+                    rules, host, method.as_str(), &retry_path, &mut retry_headers, forward_body,
+                ).await?;
                 let retry_url = format!("{scheme}://{host}{retry_path}");
                 let mut req_builder = http_client.request(method.clone(), &retry_url);
                 for (name, value) in retry_headers.iter() {
                     req_builder = req_builder.header(name.clone(), value.clone());
                 }
-                req_builder = req_builder.body(forward_body);
+                req_builder = req_builder.body(finalized_body);
                 let resp = req_builder
                     .send()
                     .await
@@ -769,13 +755,19 @@ pub(crate) async fn forward_request(
                         &mut retry_path,
                         &[candidate.rule.clone()],
                     );
+                    // Sign AFTER injection so each attempt gets a correct signature
+                    // for the candidate-specific path/headers.
+                    let attempt_body = apply_finalizer(
+                        rules, host, method.as_str(), &retry_path, &mut retry_headers,
+                        reqwest::Body::from(body_bytes.clone()),
+                    ).await?;
                     let retry_url = format!("{scheme}://{host}{retry_path}");
 
                     let mut req_builder = http_client.request(method.clone(), &retry_url);
                     for (name, value) in retry_headers.iter() {
                         req_builder = req_builder.header(name.clone(), value.clone());
                     }
-                    req_builder = req_builder.body(reqwest::Body::from(body_bytes.clone()));
+                    req_builder = req_builder.body(attempt_body);
 
                     let resp = req_builder
                         .send()
@@ -1075,6 +1067,37 @@ pub(crate) async fn forward_request(
     }
 
     Ok(response)
+}
+
+/// Run provider-specific request signing (AWS SigV4, AssumeRole) on the final
+/// headers/path/body. Returns the body unchanged when no finalizer applies.
+async fn apply_finalizer(
+    rules: &super::mitm::ResolvedRules,
+    host: &str,
+    method: &str,
+    upstream_path: &str,
+    headers: &mut hyper::HeaderMap,
+    body: reqwest::Body,
+) -> Result<reqwest::Body> {
+    match rules
+        .finalizer
+        .or_else(|| crate::apps::finalizer_for_host(host.split(':').next().unwrap_or(host)))
+    {
+        Some(crate::apps::RequestFinalizer::AwsSigV4) => {
+            super::finalizers::aws_sigv4::finalize_request(
+                host, method, upstream_path, headers, body,
+            )
+            .await
+        }
+        #[cfg(feature = "cloud")]
+        Some(crate::apps::RequestFinalizer::AwsAssumeRole) => {
+            super::finalizers::aws_sts::finalize_request(
+                host, method, upstream_path, headers, body,
+            )
+            .await
+        }
+        None => Ok(body),
+    }
 }
 
 fn emit_policy_telemetry(
