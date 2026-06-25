@@ -67,6 +67,9 @@ futures-util = "0.3"
 # LRU cache (429 rotation offset)
 lru = "0.12"
 
+# IP/CIDR matching (NO_PROXY)
+ipnet = "2"
+
 # Error handling
 anyhow = "1"
 
