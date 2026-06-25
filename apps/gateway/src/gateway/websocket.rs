@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn bypass_proxy_dot_prefix() {
-        // .example.com 只匹配子域，不匹配 example.com 本身
+        // .example.com 匹配 apex 域名及其所有子域
         assert!(should_bypass_proxy("api.example.com", ".example.com"));
         assert!(should_bypass_proxy("example.com", ".example.com"));
         assert!(!should_bypass_proxy("notexample.com", ".example.com"));
