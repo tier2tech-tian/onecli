@@ -83,6 +83,9 @@ pub(crate) struct GatewayState {
     /// Supports exact match (`internal.corp`) and wildcard prefix (`*.internal.corp`).
     /// Populated from `GATEWAY_SKIP_VERIFY_HOSTS` (comma-separated).
     pub skip_verify_hosts: Arc<Vec<String>>,
+    /// Global TLS verification bypass (`GATEWAY_DANGER_ACCEPT_INVALID_CERTS`).
+    /// When true, ALL upstream connections (HTTP + WebSocket) skip certificate validation.
+    pub danger_accept_invalid_certs: bool,
     pub policy_engine: Arc<PolicyEngine>,
     pub cache: Arc<dyn CacheStore>,
     /// Provider-agnostic vault service for credential fetching.
@@ -167,6 +170,7 @@ impl GatewayServer {
             http_client: build_http_client(global_skip),
             http_client_no_verify: build_http_client(true),
             skip_verify_hosts,
+            danger_accept_invalid_certs: global_skip,
             policy_engine,
             cache,
             vault_service,
@@ -662,9 +666,15 @@ async fn handle_connect(
     );
 
     let ca = Arc::clone(&state.ca);
-    let skip_verify = host_matches_skip_verify(&hostname, &state.skip_verify_hosts);
+    let skip_verify = state.danger_accept_invalid_certs
+        || host_matches_skip_verify(&hostname, &state.skip_verify_hosts);
     let http_client = if skip_verify {
-        info!(parent: &session_span, "TLS verification skipped (GATEWAY_SKIP_VERIFY_HOSTS)");
+        let reason = if state.danger_accept_invalid_certs {
+            "GATEWAY_DANGER_ACCEPT_INVALID_CERTS"
+        } else {
+            "GATEWAY_SKIP_VERIFY_HOSTS"
+        };
+        info!(parent: &session_span, reason, "TLS verification skipped");
         state.http_client_no_verify.clone()
     } else {
         state.http_client.clone()
@@ -695,6 +705,7 @@ async fn handle_connect(
                             proxy_ctx,
                             approval_store,
                             Arc::clone(&state.policy_engine),
+                            skip_verify,
                         )
                         .await
                     } else {
@@ -1088,5 +1099,28 @@ mod tests {
             .body(())
             .unwrap();
         assert!(!is_http_proxy_request(&req));
+    }
+
+    // ── skip_verify 合并逻辑（覆盖 DANGER_ACCEPT + SKIP_VERIFY_HOSTS）──
+
+    #[test]
+    fn skip_verify_combines_danger_accept_and_host_pattern() {
+        let hosts = vec!["chatgpt.com".to_string()];
+
+        // 仅 host pattern 匹配
+        let skip = false || host_matches_skip_verify("chatgpt.com", &hosts);
+        assert!(skip);
+
+        // host pattern 不匹配
+        let skip = false || host_matches_skip_verify("other.com", &hosts);
+        assert!(!skip);
+
+        // 全局 danger 开关覆盖一切
+        let skip = true || host_matches_skip_verify("other.com", &hosts);
+        assert!(skip, "GATEWAY_DANGER_ACCEPT_INVALID_CERTS 应让所有 host 跳过验证");
+
+        // 全局 danger + host pattern 都匹配
+        let skip = true || host_matches_skip_verify("chatgpt.com", &hosts);
+        assert!(skip);
     }
 }

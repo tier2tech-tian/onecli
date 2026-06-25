@@ -51,6 +51,7 @@ pub(super) async fn mitm(
     proxy_ctx: Arc<ProxyContext>,
     approval_store: Arc<dyn ApprovalStore>,
     policy_engine: Arc<PolicyEngine>,
+    skip_tls_verify: bool,
 ) -> Result<()> {
     let hostname = super::strip_port(host);
 
@@ -113,6 +114,7 @@ pub(super) async fn mitm(
                                     &*cache,
                                     &engine.pool,
                                     &ctx,
+                                    skip_tls_verify,
                                 )
                                 .await
                                 {

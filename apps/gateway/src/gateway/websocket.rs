@@ -92,6 +92,7 @@ pub(super) async fn handle_websocket(
     cache: &dyn CacheStore,
     pool: &sqlx::PgPool,
     proxy_ctx: &ProxyContext,
+    skip_tls_verify: bool,
 ) -> Result<Response<Either<Full<Bytes>, http_body_util::StreamBody<hooks::BodyStream>>>> {
     let start = std::time::Instant::now();
     let path = req
@@ -203,7 +204,7 @@ pub(super) async fn handle_websocket(
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(443);
 
-    let upstream_io = connect_upstream_tls(hostname, port)
+    let upstream_io = connect_upstream_tls(hostname, port, skip_tls_verify)
         .await
         .context("WebSocket: connecting to upstream")?;
 
@@ -305,21 +306,76 @@ pub(super) async fn handle_websocket(
     Ok(client_resp)
 }
 
+/// 跳过 TLS 证书验证的 ServerCertVerifier 实现。
+/// 与 gateway.rs `build_http_client(true)` 的 `danger_accept_invalid_certs(true)` 语义一致，
+/// 用于 GATEWAY_SKIP_VERIFY_HOSTS / GATEWAY_DANGER_ACCEPT_INVALID_CERTS 场景。
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 async fn connect_upstream_tls(
     hostname: &str,
     port: u16,
+    skip_verify: bool,
 ) -> Result<TokioIo<tokio_rustls::client::TlsStream<TcpStream>>> {
     let tcp = TcpStream::connect((hostname, port))
         .await
         .context("TCP connect to upstream")?;
 
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = if skip_verify {
+        // 跳过 TLS 证书验证（对应 GATEWAY_SKIP_VERIFY_HOSTS / GATEWAY_DANGER_ACCEPT_INVALID_CERTS）
+        let mut config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config
+    };
 
     let connector = TlsConnector::from(Arc::new(tls_config));
     let server_name = rustls::pki_types::ServerName::try_from(hostname.to_string())
@@ -473,5 +529,79 @@ mod tests {
 
         let name = HeaderName::from_static("accept");
         assert!(is_websocket_forwarded_header(&name));
+    }
+
+    /// NoVerifier 实现 ServerCertVerifier trait，verify_server_cert 无条件通过
+    #[test]
+    fn no_verifier_accepts_any_cert() {
+        let verifier = NoVerifier;
+        let dummy_cert = rustls::pki_types::CertificateDer::from(vec![0u8; 32]);
+        let server_name = rustls::pki_types::ServerName::try_from("example.com").unwrap();
+        let result = rustls::client::danger::ServerCertVerifier::verify_server_cert(
+            &verifier,
+            &dummy_cert,
+            &[],
+            &server_name,
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(result.is_ok());
+    }
+
+    /// NoVerifier 的 supported_verify_schemes 返回非空列表
+    #[test]
+    fn no_verifier_has_supported_schemes() {
+        let verifier = NoVerifier;
+        let schemes =
+            rustls::client::danger::ServerCertVerifier::supported_verify_schemes(&verifier);
+        assert!(!schemes.is_empty());
+    }
+
+    fn install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    /// skip_verify=false 时，connect_upstream_tls 对不存在的主机应返回错误
+    #[tokio::test]
+    async fn connect_upstream_tls_tcp_error_no_skip() {
+        install_crypto_provider();
+        let result = connect_upstream_tls("192.0.2.1", 1, false).await;
+        assert!(result.is_err(), "应当连接失败");
+    }
+
+    /// skip_verify=true 时，connect_upstream_tls 对不存在的主机同样返回错误
+    /// （skip_verify 只影响 TLS 握手阶段，不影响 TCP 连接）
+    #[tokio::test]
+    async fn connect_upstream_tls_tcp_error_with_skip() {
+        install_crypto_provider();
+        let result = connect_upstream_tls("192.0.2.1", 1, true).await;
+        assert!(result.is_err(), "应当连接失败");
+    }
+
+    /// 两种模式都能构建有效的 TlsConnector（不 panic）
+    #[test]
+    fn tls_config_builds_without_panic() {
+        install_crypto_provider();
+
+        // skip_verify=false: webpki roots
+        {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let mut config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let _connector = TlsConnector::from(Arc::new(config));
+        }
+
+        // skip_verify=true: NoVerifier
+        {
+            let mut config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let _connector = TlsConnector::from(Arc::new(config));
+        }
     }
 }
