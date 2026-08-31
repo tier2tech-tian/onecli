@@ -14,7 +14,7 @@ use hyper::body::{Bytes, Frame, Incoming};
 use hyper::header::HeaderName;
 use hyper::{Request, Response, StatusCode};
 use lru::LruCache;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::approval::{
     ApprovalDecision, ApprovalGuard, ApprovalStore, PendingApproval, APPROVAL_TIMEOUT_SECS,
@@ -777,14 +777,14 @@ pub(crate) async fn forward_request(
                     // If NOT 429, or this is the last candidate, return this response.
                     if st != StatusCode::TOO_MANY_REQUESTS || i == n - 1 {
                         if st == StatusCode::TOO_MANY_REQUESTS && i > 0 {
-                            debug!(
+                            warn!(
                                 secret_id = %candidate.secret_id,
                                 attempt = i + 1,
                                 total = n,
                                 "all rotation candidates exhausted with 429"
                             );
                         } else if i > 0 {
-                            debug!(
+                            info!(
                                 secret_id = %candidate.secret_id,
                                 attempt = i + 1,
                                 total = n,
@@ -799,7 +799,7 @@ pub(crate) async fn forward_request(
                     }
 
                     // Got 429 with more candidates — rotate.
-                    debug!(
+                    info!(
                         secret_id = %candidate.secret_id,
                         attempt = i + 1,
                         total = n,
