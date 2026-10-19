@@ -14,7 +14,7 @@ use hyper::body::{Bytes, Frame, Incoming};
 use hyper::header::HeaderName;
 use hyper::{Request, Response, StatusCode};
 use lru::LruCache;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::approval::{
     ApprovalDecision, ApprovalGuard, ApprovalStore, PendingApproval, APPROVAL_TIMEOUT_SECS,
@@ -128,7 +128,6 @@ enum InjectionSource<'a> {
         offset: usize,
     },
     /// Exactly one secret matches — single-shot, no rotation possible.
-    #[allow(dead_code)] // candidate metadata available for logging, not used for injection
     SingleSecret { candidate: &'a SecretCandidate },
     /// No secret candidates — use existing injection_rules (app/vault).
     Fallback,
@@ -195,6 +194,7 @@ pub(crate) async fn forward_request(
     pool: &sqlx::PgPool,
 ) -> Result<Response<hooks::ForwardResponseBody>> {
     let start = std::time::Instant::now();
+    let request_id = uuid::Uuid::new_v4();
     let method = req.method().clone();
     let path = req
         .uri()
@@ -695,6 +695,15 @@ pub(crate) async fn forward_request(
                 // Body too large for retry — fall through to single-shot with first candidate.
                 let idx = offset % candidates.len();
                 let candidate = candidates[idx];
+                info!(
+                    %request_id, host, method = %method,
+                    original_content_length = ?original_content_length,
+                    retry_body_limit = RETRY_BODY_LIMIT,
+                    total = candidates.len(), secret_id = %candidate.secret_id,
+                    rotation_enabled = false, reason = "content_length_exceeds_retry_limit",
+                    "请求超过缓冲上限，跳过账号轮换"
+                );
+                let attempt_start = std::time::Instant::now();
                 let mut retry_headers = headers.clone();
                 let mut retry_path = path.clone();
                 let real_count = inject::apply_injections(
@@ -717,6 +726,13 @@ pub(crate) async fn forward_request(
                     .await
                     .with_context(|| format!("forwarding to {url}"))?;
                 let st = resp.status();
+                info!(
+                    %request_id, secret_id = %candidate.secret_id,
+                    attempt = 1, total = candidates.len(), status = st.as_u16(),
+                    upstream_request_id = ?resp.headers().get("request-id").and_then(|v| v.to_str().ok()),
+                    latency_ms = attempt_start.elapsed().as_millis() as u64,
+                    "单次上游请求结束"
+                );
                 let rh = resp.headers().clone();
                 (resp, st, rh, real_count)
             } else {
@@ -725,6 +741,12 @@ pub(crate) async fn forward_request(
                 let body_bytes = match read_body_with_limit(forward_body, RETRY_BODY_LIMIT).await {
                     Ok(bytes) => bytes,
                     Err(_) => {
+                        warn!(
+                            %request_id, host, original_content_length = ?original_content_length,
+                            retry_body_limit = RETRY_BODY_LIMIT, total = candidates.len(),
+                            reason = "retry_body_read_failed", status = 413,
+                            "重试请求体读取失败，返回本地 413"
+                        );
                         return Ok(response::json(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             serde_json::json!({
@@ -736,6 +758,13 @@ pub(crate) async fn forward_request(
                 };
 
                 let n = candidates.len();
+                info!(
+                    %request_id, host, method = %method,
+                    original_content_length = ?original_content_length,
+                    buffered_body_bytes = body_bytes.len(), retry_body_limit = RETRY_BODY_LIMIT,
+                    total = n, rotation_enabled = true,
+                    "请求已缓冲，启用账号轮换"
+                );
                 let mut last_resp = None;
                 let mut last_status = StatusCode::OK;
                 let mut last_headers = hyper::HeaderMap::new();
@@ -744,6 +773,7 @@ pub(crate) async fn forward_request(
                 for i in 0..n {
                     let idx = (offset + i) % n;
                     let candidate = candidates[idx];
+                    let attempt_start = std::time::Instant::now();
 
                     let mut retry_headers = headers.clone();
                     let mut retry_path = path.clone();
@@ -772,24 +802,33 @@ pub(crate) async fn forward_request(
                         .with_context(|| format!("forwarding to {url} (rotation attempt {i})"))?;
 
                     let st = resp.status();
+                    info!(
+                        %request_id, secret_id = %candidate.secret_id,
+                        attempt = i + 1, total = n, status = st.as_u16(),
+                        upstream_request_id = ?resp.headers().get("request-id").and_then(|v| v.to_str().ok()),
+                        latency_ms = attempt_start.elapsed().as_millis() as u64,
+                        "账号请求结束"
+                    );
                     let rh = resp.headers().clone();
 
                     // If NOT 429, or this is the last candidate, return this response.
                     if st != StatusCode::TOO_MANY_REQUESTS || i == n - 1 {
                         if st == StatusCode::TOO_MANY_REQUESTS && i > 0 {
-                            debug!(
+                            warn!(
+                                %request_id,
                                 secret_id = %candidate.secret_id,
                                 attempt = i + 1,
                                 total = n,
-                                "all rotation candidates exhausted with 429"
+                                "全部候选账号返回 429，结束轮换"
                             );
                         } else if i > 0 {
-                            debug!(
+                            info!(
+                                %request_id,
                                 secret_id = %candidate.secret_id,
                                 attempt = i + 1,
                                 total = n,
                                 status = %st.as_u16(),
-                                "rotation succeeded after 429"
+                                "收到非 429 响应，结束轮换"
                             );
                         }
                         last_resp = Some(resp);
@@ -799,11 +838,12 @@ pub(crate) async fn forward_request(
                     }
 
                     // Got 429 with more candidates — rotate.
-                    debug!(
+                    info!(
+                        %request_id,
                         secret_id = %candidate.secret_id,
                         attempt = i + 1,
                         total = n,
-                        "upstream 429 — rotating to next secret candidate"
+                        "上游返回 429，切换下一候选账号"
                     );
                     // Consume and discard the 429 response body so the connection is freed.
                     let _ = resp.bytes().await;
@@ -812,8 +852,20 @@ pub(crate) async fn forward_request(
                 (last_resp.unwrap(), last_status, last_headers, real_injection_count)
             }
         }
-        _ => {
+        source => {
             // SingleSecret or Fallback — normal single-shot path.
+            let (secret_id, reason) = match source {
+                InjectionSource::SingleSecret { candidate } => {
+                    (Some(candidate.secret_id.as_str()), "single_candidate")
+                }
+                _ => (None, "no_secret_candidates"),
+            };
+            info!(
+                %request_id, host, method = %method,
+                original_content_length = ?original_content_length,
+                secret_id = ?secret_id, rotation_enabled = false, reason,
+                "请求使用单次转发"
+            );
             let mut req_builder = http_client.request(method.clone(), &upstream_url);
             for (name, value) in headers.iter() {
                 req_builder = req_builder.header(name.clone(), value.clone());
@@ -976,10 +1028,12 @@ pub(crate) async fn forward_request(
         .unwrap_or("-");
 
     info!(
+        %request_id,
         method = %method,
         url = %url,
         status = %status.as_u16(),
         content_type = %content_type,
+        upstream_request_id = ?resp_headers.get("request-id").and_then(|v| v.to_str().ok()),
         injections_applied = injection_count,
         "MITM"
     );
