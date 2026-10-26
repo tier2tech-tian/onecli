@@ -394,6 +394,30 @@ pub(crate) async fn forward_request(
     // made BEFORE apply_injections so the rotation path can apply per-candidate
     // rules independently.
     let account_id = proxy_ctx.agent_id.as_deref().unwrap_or("");
+    let quota_scoped = super::cooldown::applies(host, &path);
+    let matching_ids: Vec<String> = rules
+        .secret_candidates
+        .iter()
+        .filter(|c| inject::path_matches(&path, &c.rule.path_pattern))
+        .map(|c| c.secret_id.clone())
+        .collect();
+    let locks = if quota_scoped {
+        super::cooldown::active(pool, &matching_ids).await
+    } else {
+        std::collections::HashMap::new()
+    };
+    if !matching_ids.is_empty() && matching_ids.iter().all(|id| locks.contains_key(id)) {
+        return Ok(super::cooldown::blocked(
+            *locks.values().min().unwrap(),
+            request_id,
+            proxy_ctx,
+            host,
+            method.as_str(),
+            &path,
+            start.elapsed().as_millis() as u32,
+            (None, None, None),
+        ));
+    }
     let injection_source =
         select_injection_source(&rules.secret_candidates, &path, account_id, host);
 
@@ -446,6 +470,11 @@ pub(crate) async fn forward_request(
             // We still count as "has injections" for pre_forward checks.
             rules.injection_rules.len()
         }
+        InjectionSource::SingleSecret { candidate } if quota_scoped => inject::apply_injections(
+            &mut headers,
+            &mut upstream_path,
+            std::slice::from_ref(&candidate.rule),
+        ),
         _ => inject::apply_injections(&mut headers, &mut upstream_path, &rules.injection_rules),
     };
     let upstream_url = format!("{scheme}://{host}{upstream_path}");
@@ -736,8 +765,30 @@ pub(crate) async fn forward_request(
 
             if !can_buffer {
                 // Body too large for retry — fall through to single-shot with first candidate.
-                let idx = offset % candidates.len();
-                let candidate = candidates[idx];
+                let current = if quota_scoped {
+                    super::cooldown::active(pool, &matching_ids).await
+                } else {
+                    std::collections::HashMap::new()
+                };
+                let candidate = (0..candidates.len())
+                    .map(|i| candidates[(offset + i) % candidates.len()])
+                    .find(|c| !current.contains_key(&c.secret_id));
+                let Some(candidate) = candidate else {
+                    return Ok(super::cooldown::blocked(
+                        *current.values().min().unwrap(),
+                        request_id,
+                        proxy_ctx,
+                        host,
+                        method.as_str(),
+                        &path,
+                        start.elapsed().as_millis() as u32,
+                        (
+                            approval_log_id.as_deref(),
+                            approval_id_for_telemetry.as_deref(),
+                            approval_triggered_at.as_deref(),
+                        ),
+                    ));
+                };
                 info!(
                     %request_id, host, method = %method,
                     original_content_length = ?original_content_length,
@@ -752,7 +803,7 @@ pub(crate) async fn forward_request(
                 let real_count = inject::apply_injections(
                     &mut retry_headers,
                     &mut retry_path,
-                    &[candidate.rule.clone()],
+                    std::slice::from_ref(&candidate.rule),
                 );
                 // Sign AFTER injection so path/headers include candidate credentials.
                 let finalized_body = apply_finalizer(
@@ -792,6 +843,8 @@ pub(crate) async fn forward_request(
                         );
                     })
                     .with_context(|| format!("forwarding to {url}"))?;
+                super::cooldown::observe(pool, Some(&candidate.secret_id), host, &path, &resp)
+                    .await;
                 let resp = super::diagnostics::record_attempt(
                     resp,
                     request_id,
@@ -846,9 +899,21 @@ pub(crate) async fn forward_request(
                 let mut last_headers = hyper::HeaderMap::new();
                 let mut real_injection_count = 0;
 
+                let mut skipped_until: Option<i64> = None;
                 for i in 0..n {
                     let idx = (offset + i) % n;
                     let candidate = candidates[idx];
+                    if quota_scoped {
+                        let current = super::cooldown::active(
+                            pool,
+                            std::slice::from_ref(&candidate.secret_id),
+                        )
+                        .await;
+                        if let Some(&until) = current.get(&candidate.secret_id) {
+                            skipped_until = Some(skipped_until.map_or(until, |v| v.min(until)));
+                            continue;
+                        }
+                    }
                     let attempt_start = std::time::Instant::now();
 
                     let mut retry_headers = headers.clone();
@@ -856,7 +921,7 @@ pub(crate) async fn forward_request(
                     real_injection_count = inject::apply_injections(
                         &mut retry_headers,
                         &mut retry_path,
-                        &[candidate.rule.clone()],
+                        std::slice::from_ref(&candidate.rule),
                     );
                     // Sign AFTER injection so each attempt gets a correct signature
                     // for the candidate-specific path/headers.
@@ -900,6 +965,8 @@ pub(crate) async fn forward_request(
                         })
                         .with_context(|| format!("forwarding to {url} (rotation attempt {i})"))?;
 
+                    super::cooldown::observe(pool, Some(&candidate.secret_id), host, &path, &resp)
+                        .await;
                     let resp = super::diagnostics::record_attempt(
                         resp,
                         request_id,
@@ -953,10 +1020,28 @@ pub(crate) async fn forward_request(
                         total = n,
                         "上游返回 429，切换下一候选账号"
                     );
-                    // Consume and discard the 429 response body so the connection is freed.
-                    let _ = resp.bytes().await;
+                    // 保留最后一次429，后续候选被并发冷却时仍返回真实上游响应。
+                    last_status = st;
+                    last_headers = rh;
+                    last_resp = Some(resp);
                 }
 
+                if last_resp.is_none() {
+                    return Ok(super::cooldown::blocked(
+                        skipped_until.expect("所有候选均因冷却跳过"),
+                        request_id,
+                        proxy_ctx,
+                        host,
+                        method.as_str(),
+                        &path,
+                        start.elapsed().as_millis() as u32,
+                        (
+                            approval_log_id.as_deref(),
+                            approval_id_for_telemetry.as_deref(),
+                            approval_triggered_at.as_deref(),
+                        ),
+                    ));
+                }
                 (
                     last_resp.unwrap(),
                     last_status,
@@ -979,6 +1064,27 @@ pub(crate) async fn forward_request(
                 secret_id = ?secret_id, rotation_enabled = false, reason,
                 "请求使用单次转发"
             );
+            if quota_scoped {
+                if let Some(id) = secret_id {
+                    let current = super::cooldown::active(pool, &[id.to_owned()]).await;
+                    if let Some(until) = current.get(id) {
+                        return Ok(super::cooldown::blocked(
+                            *until,
+                            request_id,
+                            proxy_ctx,
+                            host,
+                            method.as_str(),
+                            &path,
+                            start.elapsed().as_millis() as u32,
+                            (
+                                approval_log_id.as_deref(),
+                                approval_id_for_telemetry.as_deref(),
+                                approval_triggered_at.as_deref(),
+                            ),
+                        ));
+                    }
+                }
+            }
             let mut req_builder = http_client.request(method.clone(), &upstream_url);
             for (name, value) in headers.iter() {
                 req_builder = req_builder.header(name.clone(), value.clone());
@@ -1007,6 +1113,7 @@ pub(crate) async fn forward_request(
                     );
                 })
                 .with_context(|| format!("forwarding to {url}"))?;
+            super::cooldown::observe(pool, secret_id, host, &path, &resp).await;
             let resp = super::diagnostics::record_attempt(
                 resp,
                 request_id,
