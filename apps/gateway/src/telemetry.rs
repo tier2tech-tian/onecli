@@ -33,7 +33,11 @@ pub(crate) fn init(pool: PgPool, _cache: Arc<dyn CacheStore>) {
 async fn insert_batch(pool: &PgPool, events: &[RequestEvent]) -> Result<(), sqlx::Error> {
     let filtered: Vec<&RequestEvent> = events
         .iter()
-        .filter(|e| e.injected || !matches!(e.decision, RequestDecision::Allowed))
+        .filter(|e| {
+            e.injected
+                || !matches!(e.decision, RequestDecision::Allowed)
+                || (e.status >= 400 && e.diagnostics.is_some())
+        })
         .collect();
     if filtered.is_empty() {
         return Ok(());
@@ -41,8 +45,8 @@ async fn insert_batch(pool: &PgPool, events: &[RequestEvent]) -> Result<(), sqlx
     let c = extract_columns(&filtered);
 
     sqlx::query(
-        "INSERT INTO request_logs (id, project_id, agent_id, method, host, path, provider, status, latency_ms, injection_count)
-         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::int4[], $9::int4[], $10::int4[])",
+        "INSERT INTO request_logs (id, project_id, agent_id, method, host, path, provider, status, latency_ms, injection_count, extra_data)
+         SELECT id, project_id, agent_id, method, host, path, provider, status, latency_ms, injection_count, extra_data::jsonb FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::int4[], $9::int4[], $10::int4[], $11::text[]) AS t(id, project_id, agent_id, method, host, path, provider, status, latency_ms, injection_count, extra_data)",
     )
     .bind(&c.ids)
     .bind(&c.project_ids)
@@ -54,6 +58,7 @@ async fn insert_batch(pool: &PgPool, events: &[RequestEvent]) -> Result<(), sqlx
     .bind(&c.statuses)
     .bind(&c.latencies)
     .bind(&c.injections)
+    .bind(&c.extra_data)
     .execute(pool)
     .await?;
 
@@ -92,6 +97,12 @@ async fn update_batch(pool: &PgPool, events: &[RequestEvent]) {
             .to_string(),
             _ => "{}".to_string(),
         };
+        let mut extra: serde_json::Value =
+            serde_json::from_str(&extra).unwrap_or_else(|_| json!({}));
+        if let Some(diagnostics) = &event.diagnostics {
+            extra["upstream"] = diagnostics.clone();
+        }
+        let extra = extra.to_string();
         if let Err(e) = sqlx::query(
             "UPDATE request_logs \
              SET status = $1, latency_ms = $2, \

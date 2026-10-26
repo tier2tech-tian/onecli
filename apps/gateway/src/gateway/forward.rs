@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{LazyLock, Mutex};
 use std::sync::Arc;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -14,7 +14,7 @@ use hyper::body::{Bytes, Frame, Incoming};
 use hyper::header::HeaderName;
 use hyper::{Request, Response, StatusCode};
 use lru::LruCache;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::approval::{
     ApprovalDecision, ApprovalGuard, ApprovalStore, PendingApproval, APPROVAL_TIMEOUT_SECS,
@@ -116,7 +116,9 @@ const ROTATION_CACHE_CAP: usize = 1024;
 /// Each get-and-increment advances the offset so consecutive requests to the
 /// same host round-robin through available secret candidates.
 static ROTATION_OFFSETS: LazyLock<Mutex<LruCache<(String, String), usize>>> = LazyLock::new(|| {
-    Mutex::new(LruCache::new(NonZeroUsize::new(ROTATION_CACHE_CAP).unwrap()))
+    Mutex::new(LruCache::new(
+        NonZeroUsize::new(ROTATION_CACHE_CAP).unwrap(),
+    ))
 });
 
 /// Injection source selection result for 429 rotation.
@@ -128,7 +130,6 @@ enum InjectionSource<'a> {
         offset: usize,
     },
     /// Exactly one secret matches — single-shot, no rotation possible.
-    #[allow(dead_code)] // candidate metadata available for logging, not used for injection
     SingleSecret { candidate: &'a SecretCandidate },
     /// No secret candidates — use existing injection_rules (app/vault).
     Fallback,
@@ -195,6 +196,7 @@ pub(crate) async fn forward_request(
     pool: &sqlx::PgPool,
 ) -> Result<Response<hooks::ForwardResponseBody>> {
     let start = std::time::Instant::now();
+    let request_id = uuid::Uuid::new_v4();
     let method = req.method().clone();
     let path = req
         .uri()
@@ -392,12 +394,48 @@ pub(crate) async fn forward_request(
     // made BEFORE apply_injections so the rotation path can apply per-candidate
     // rules independently.
     let account_id = proxy_ctx.agent_id.as_deref().unwrap_or("");
-    let injection_source = select_injection_source(
-        &rules.secret_candidates,
-        &path,
-        account_id,
-        host,
-    );
+    let injection_source =
+        select_injection_source(&rules.secret_candidates, &path, account_id, host);
+
+    let mut diagnostic_attempts = Vec::new();
+    let (rotation_candidates, rotation_start, rotation_reason) = match &injection_source {
+        InjectionSource::MultiSecret { candidates, offset } => (
+            candidates.len(),
+            Some(offset % candidates.len()),
+            if original_content_length.is_some_and(|n| n > RETRY_BODY_LIMIT) {
+                "content_length_exceeds_retry_limit"
+            } else {
+                "round_robin"
+            },
+        ),
+        InjectionSource::SingleSecret { .. } => (1, None, "single_candidate"),
+        InjectionSource::Fallback => (0, None, "no_secret_candidates"),
+    };
+    let mut diagnostic_secrets: Vec<String> = rules
+        .injection_rules
+        .iter()
+        .chain(rules.secret_candidates.iter().map(|c| &c.rule))
+        .flat_map(|r| r.injections.iter())
+        .filter_map(|i| match i {
+            crate::inject::Injection::SetHeader { value, .. }
+            | crate::inject::Injection::ReplaceHeader { value, .. }
+            | crate::inject::Injection::SetParam { value, .. } => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
+    if let Some(token) = &proxy_ctx.agent_token {
+        diagnostic_secrets.push(token.clone());
+    }
+    for name in [
+        "authorization",
+        "x-api-key",
+        "proxy-authorization",
+        "cookie",
+    ] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            diagnostic_secrets.push(value.to_owned());
+        }
+    }
 
     // Apply injection rules — upstream_path may gain query-param secrets;
     // the original `path`/`url` stays clean for logging and approval metadata.
@@ -408,9 +446,7 @@ pub(crate) async fn forward_request(
             // We still count as "has injections" for pre_forward checks.
             rules.injection_rules.len()
         }
-        _ => {
-            inject::apply_injections(&mut headers, &mut upstream_path, &rules.injection_rules)
-        }
+        _ => inject::apply_injections(&mut headers, &mut upstream_path, &rules.injection_rules),
     };
     let upstream_url = format!("{scheme}://{host}{upstream_path}");
 
@@ -680,8 +716,15 @@ pub(crate) async fn forward_request(
     let forward_body = if matches!(&injection_source, InjectionSource::MultiSecret { .. }) {
         forward_body
     } else {
-        apply_finalizer(rules, host, method.as_str(), &upstream_path, &mut headers, forward_body)
-            .await?
+        apply_finalizer(
+            rules,
+            host,
+            method.as_str(),
+            &upstream_path,
+            &mut headers,
+            forward_body,
+        )
+        .await?
     };
 
     // ── Forward to upstream (with optional 429 rotation) ─────────────
@@ -695,6 +738,15 @@ pub(crate) async fn forward_request(
                 // Body too large for retry — fall through to single-shot with first candidate.
                 let idx = offset % candidates.len();
                 let candidate = candidates[idx];
+                info!(
+                    %request_id, host, method = %method,
+                    original_content_length = ?original_content_length,
+                    retry_body_limit = RETRY_BODY_LIMIT,
+                    total = candidates.len(), secret_id = %candidate.secret_id,
+                    rotation_enabled = false, reason = "content_length_exceeds_retry_limit",
+                    "请求超过缓冲上限，跳过账号轮换"
+                );
+                let attempt_start = std::time::Instant::now();
                 let mut retry_headers = headers.clone();
                 let mut retry_path = path.clone();
                 let real_count = inject::apply_injections(
@@ -704,8 +756,14 @@ pub(crate) async fn forward_request(
                 );
                 // Sign AFTER injection so path/headers include candidate credentials.
                 let finalized_body = apply_finalizer(
-                    rules, host, method.as_str(), &retry_path, &mut retry_headers, forward_body,
-                ).await?;
+                    rules,
+                    host,
+                    method.as_str(),
+                    &retry_path,
+                    &mut retry_headers,
+                    forward_body,
+                )
+                .await?;
                 let retry_url = format!("{scheme}://{host}{retry_path}");
                 let mut req_builder = http_client.request(method.clone(), &retry_url);
                 for (name, value) in retry_headers.iter() {
@@ -715,8 +773,42 @@ pub(crate) async fn forward_request(
                 let resp = req_builder
                     .send()
                     .await
+                    .inspect_err(|error| {
+                        super::diagnostics::record_transport_error(
+                            error,
+                            request_id,
+                            Some(&candidate.secret_id),
+                            attempt_start.elapsed().as_millis() as u64,
+                            &mut diagnostic_attempts,
+                            proxy_ctx,
+                            host,
+                            method.as_str(),
+                            &path,
+                            (
+                                approval_log_id.as_deref(),
+                                approval_id_for_telemetry.as_deref(),
+                                approval_triggered_at.as_deref(),
+                            ),
+                        );
+                    })
                     .with_context(|| format!("forwarding to {url}"))?;
+                let resp = super::diagnostics::record_attempt(
+                    resp,
+                    request_id,
+                    Some(&candidate.secret_id),
+                    attempt_start.elapsed().as_millis() as u64,
+                    &diagnostic_secrets,
+                    &mut diagnostic_attempts,
+                )
+                .await;
                 let st = resp.status();
+                info!(
+                    %request_id, secret_id = %candidate.secret_id,
+                    attempt = 1, total = candidates.len(), status = st.as_u16(),
+                    upstream_request_id = ?resp.headers().get("request-id").and_then(|v| v.to_str().ok()),
+                    latency_ms = attempt_start.elapsed().as_millis() as u64,
+                    "单次上游请求结束"
+                );
                 let rh = resp.headers().clone();
                 (resp, st, rh, real_count)
             } else {
@@ -725,6 +817,12 @@ pub(crate) async fn forward_request(
                 let body_bytes = match read_body_with_limit(forward_body, RETRY_BODY_LIMIT).await {
                     Ok(bytes) => bytes,
                     Err(_) => {
+                        warn!(
+                            %request_id, host, original_content_length = ?original_content_length,
+                            retry_body_limit = RETRY_BODY_LIMIT, total = candidates.len(),
+                            reason = "retry_body_read_failed", status = 413,
+                            "重试请求体读取失败，返回本地 413"
+                        );
                         return Ok(response::json(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             serde_json::json!({
@@ -736,6 +834,13 @@ pub(crate) async fn forward_request(
                 };
 
                 let n = candidates.len();
+                info!(
+                    %request_id, host, method = %method,
+                    original_content_length = ?original_content_length,
+                    buffered_body_bytes = body_bytes.len(), retry_body_limit = RETRY_BODY_LIMIT,
+                    total = n, rotation_enabled = true,
+                    "请求已缓冲，启用账号轮换"
+                );
                 let mut last_resp = None;
                 let mut last_status = StatusCode::OK;
                 let mut last_headers = hyper::HeaderMap::new();
@@ -744,6 +849,7 @@ pub(crate) async fn forward_request(
                 for i in 0..n {
                     let idx = (offset + i) % n;
                     let candidate = candidates[idx];
+                    let attempt_start = std::time::Instant::now();
 
                     let mut retry_headers = headers.clone();
                     let mut retry_path = path.clone();
@@ -755,9 +861,14 @@ pub(crate) async fn forward_request(
                     // Sign AFTER injection so each attempt gets a correct signature
                     // for the candidate-specific path/headers.
                     let attempt_body = apply_finalizer(
-                        rules, host, method.as_str(), &retry_path, &mut retry_headers,
+                        rules,
+                        host,
+                        method.as_str(),
+                        &retry_path,
+                        &mut retry_headers,
                         reqwest::Body::from(body_bytes.clone()),
-                    ).await?;
+                    )
+                    .await?;
                     let retry_url = format!("{scheme}://{host}{retry_path}");
 
                     let mut req_builder = http_client.request(method.clone(), &retry_url);
@@ -769,27 +880,63 @@ pub(crate) async fn forward_request(
                     let resp = req_builder
                         .send()
                         .await
+                        .inspect_err(|error| {
+                            super::diagnostics::record_transport_error(
+                                error,
+                                request_id,
+                                Some(&candidate.secret_id),
+                                attempt_start.elapsed().as_millis() as u64,
+                                &mut diagnostic_attempts,
+                                proxy_ctx,
+                                host,
+                                method.as_str(),
+                                &path,
+                                (
+                                    approval_log_id.as_deref(),
+                                    approval_id_for_telemetry.as_deref(),
+                                    approval_triggered_at.as_deref(),
+                                ),
+                            );
+                        })
                         .with_context(|| format!("forwarding to {url} (rotation attempt {i})"))?;
 
+                    let resp = super::diagnostics::record_attempt(
+                        resp,
+                        request_id,
+                        Some(&candidate.secret_id),
+                        attempt_start.elapsed().as_millis() as u64,
+                        &diagnostic_secrets,
+                        &mut diagnostic_attempts,
+                    )
+                    .await;
                     let st = resp.status();
+                    info!(
+                        %request_id, secret_id = %candidate.secret_id,
+                        attempt = i + 1, total = n, status = st.as_u16(),
+                        upstream_request_id = ?resp.headers().get("request-id").and_then(|v| v.to_str().ok()),
+                        latency_ms = attempt_start.elapsed().as_millis() as u64,
+                        "账号请求结束"
+                    );
                     let rh = resp.headers().clone();
 
                     // If NOT 429, or this is the last candidate, return this response.
                     if st != StatusCode::TOO_MANY_REQUESTS || i == n - 1 {
                         if st == StatusCode::TOO_MANY_REQUESTS && i > 0 {
-                            debug!(
+                            warn!(
+                                %request_id,
                                 secret_id = %candidate.secret_id,
                                 attempt = i + 1,
                                 total = n,
-                                "all rotation candidates exhausted with 429"
+                                "全部候选账号返回 429，结束轮换"
                             );
                         } else if i > 0 {
-                            debug!(
+                            info!(
+                                %request_id,
                                 secret_id = %candidate.secret_id,
                                 attempt = i + 1,
                                 total = n,
                                 status = %st.as_u16(),
-                                "rotation succeeded after 429"
+                                "收到非 429 响应，结束轮换"
                             );
                         }
                         last_resp = Some(resp);
@@ -799,30 +946,76 @@ pub(crate) async fn forward_request(
                     }
 
                     // Got 429 with more candidates — rotate.
-                    debug!(
+                    info!(
+                        %request_id,
                         secret_id = %candidate.secret_id,
                         attempt = i + 1,
                         total = n,
-                        "upstream 429 — rotating to next secret candidate"
+                        "上游返回 429，切换下一候选账号"
                     );
                     // Consume and discard the 429 response body so the connection is freed.
                     let _ = resp.bytes().await;
                 }
 
-                (last_resp.unwrap(), last_status, last_headers, real_injection_count)
+                (
+                    last_resp.unwrap(),
+                    last_status,
+                    last_headers,
+                    real_injection_count,
+                )
             }
         }
-        _ => {
+        source => {
             // SingleSecret or Fallback — normal single-shot path.
+            let (secret_id, reason) = match source {
+                InjectionSource::SingleSecret { candidate } => {
+                    (Some(candidate.secret_id.as_str()), "single_candidate")
+                }
+                _ => (None, "no_secret_candidates"),
+            };
+            info!(
+                %request_id, host, method = %method,
+                original_content_length = ?original_content_length,
+                secret_id = ?secret_id, rotation_enabled = false, reason,
+                "请求使用单次转发"
+            );
             let mut req_builder = http_client.request(method.clone(), &upstream_url);
             for (name, value) in headers.iter() {
                 req_builder = req_builder.header(name.clone(), value.clone());
             }
             req_builder = req_builder.body(forward_body);
+            let attempt_start = std::time::Instant::now();
             let resp = req_builder
                 .send()
                 .await
+                .inspect_err(|error| {
+                    super::diagnostics::record_transport_error(
+                        error,
+                        request_id,
+                        secret_id,
+                        attempt_start.elapsed().as_millis() as u64,
+                        &mut diagnostic_attempts,
+                        proxy_ctx,
+                        host,
+                        method.as_str(),
+                        &path,
+                        (
+                            approval_log_id.as_deref(),
+                            approval_id_for_telemetry.as_deref(),
+                            approval_triggered_at.as_deref(),
+                        ),
+                    );
+                })
                 .with_context(|| format!("forwarding to {url}"))?;
+            let resp = super::diagnostics::record_attempt(
+                resp,
+                request_id,
+                secret_id,
+                attempt_start.elapsed().as_millis() as u64,
+                &diagnostic_secrets,
+                &mut diagnostic_attempts,
+            )
+            .await;
             let st = resp.status();
             let rh = resp.headers().clone();
             (resp, st, rh, injection_count)
@@ -976,10 +1169,12 @@ pub(crate) async fn forward_request(
         .unwrap_or("-");
 
     info!(
+        %request_id,
         method = %method,
         url = %url,
         status = %status.as_u16(),
         content_type = %content_type,
+        upstream_request_id = ?resp_headers.get("request-id").and_then(|v| v.to_str().ok()),
         injections_applied = injection_count,
         "MITM"
     );
@@ -1046,6 +1241,11 @@ pub(crate) async fn forward_request(
             connection_label: rules.connection_label.clone(),
             existing_log_id: approval_log_id,
             decision: approval_decision,
+            diagnostics: Some(serde_json::json!({
+                "request_id": request_id.to_string(), "candidate_count": rotation_candidates,
+                "start_index": rotation_start, "rotation_reason": rotation_reason,
+                "final_status": status.as_u16(), "attempts": diagnostic_attempts,
+            })),
         };
 
         hooks::track_and_wrap(meta, rules, &resp_headers, upstream_resp.bytes_stream())
@@ -1082,16 +1282,18 @@ async fn apply_finalizer(
     {
         Some(crate::apps::RequestFinalizer::AwsSigV4) => {
             super::finalizers::aws_sigv4::finalize_request(
-                host, method, upstream_path, headers, body,
+                host,
+                method,
+                upstream_path,
+                headers,
+                body,
             )
             .await
         }
         #[cfg(feature = "cloud")]
         Some(crate::apps::RequestFinalizer::AwsAssumeRole) => {
-            super::finalizers::aws_sts::finalize_request(
-                host, method, upstream_path, headers, body,
-            )
-            .await
+            super::finalizers::aws_sts::finalize_request(host, method, upstream_path, headers, body)
+                .await
         }
         None => Ok(body),
     }
@@ -1167,6 +1369,7 @@ fn emit_policy_telemetry(
         existing_log_id: None,
         log_id: None,
         budget_charge: None,
+        diagnostics: None,
     });
 }
 
@@ -1222,6 +1425,7 @@ fn emit_approval_telemetry(
         existing_log_id,
         log_id,
         budget_charge: None,
+        diagnostics: None,
     });
 }
 
@@ -1402,9 +1606,13 @@ mod tests {
             make_candidate("s2", "*"),
             make_candidate("s3", "*"),
         ];
-        let source = select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+        let source =
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
         match source {
-            InjectionSource::MultiSecret { candidates: matched, .. } => {
+            InjectionSource::MultiSecret {
+                candidates: matched,
+                ..
+            } => {
                 assert_eq!(matched.len(), 3);
             }
             _ => panic!("expected MultiSecret"),
@@ -1413,11 +1621,9 @@ mod tests {
 
     #[test]
     fn injection_source_single_secret_by_path_filter() {
-        let candidates = vec![
-            make_candidate("s1", "/v1/*"),
-            make_candidate("s2", "/v2/*"),
-        ];
-        let source = select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+        let candidates = vec![make_candidate("s1", "/v1/*"), make_candidate("s2", "/v2/*")];
+        let source =
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
         match source {
             InjectionSource::SingleSecret { candidate } => {
                 assert_eq!(candidate.secret_id, "s1");
@@ -1434,11 +1640,9 @@ mod tests {
 
     #[test]
     fn injection_source_fallback_path_mismatch() {
-        let candidates = vec![
-            make_candidate("s1", "/v2/*"),
-            make_candidate("s2", "/v3/*"),
-        ];
-        let source = select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+        let candidates = vec![make_candidate("s1", "/v2/*"), make_candidate("s2", "/v3/*")];
+        let source =
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
         assert!(matches!(source, InjectionSource::Fallback));
     }
 
@@ -1449,7 +1653,8 @@ mod tests {
             make_candidate("s1", "/v1/messages"),
             make_candidate("s2", "/v1/completions"),
         ];
-        let source = select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+        let source =
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
         match source {
             InjectionSource::SingleSecret { candidate } => {
                 assert_eq!(candidate.secret_id, "s1");
@@ -1460,17 +1665,17 @@ mod tests {
 
     #[test]
     fn injection_source_multi_offset_wraps() {
-        let candidates = vec![
-            make_candidate("s1", "*"),
-            make_candidate("s2", "*"),
-        ];
+        let candidates = vec![make_candidate("s1", "*"), make_candidate("s2", "*")];
         // Call multiple times to test offset advancement and wrapping.
         // Each call advances the global offset, but we only verify the
         // returned variant is MultiSecret with correct candidate count.
         for _ in 0..5 {
             let source = select_injection_source(&candidates, "/v1/x", "acct_wrap", "host.wrap");
             match source {
-                InjectionSource::MultiSecret { candidates: matched, .. } => {
+                InjectionSource::MultiSecret {
+                    candidates: matched,
+                    ..
+                } => {
                     assert_eq!(matched.len(), 2);
                 }
                 _ => panic!("expected MultiSecret"),

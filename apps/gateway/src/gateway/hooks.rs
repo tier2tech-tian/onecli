@@ -38,6 +38,7 @@ pub(crate) struct RequestMeta {
     pub connection_label: Option<String>,
     pub existing_log_id: Option<String>,
     pub decision: Option<crate::telemetry_core::RequestDecision>,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 // ── Hooks ───────────────────────────────────────────────────────────────
@@ -114,6 +115,7 @@ pub(crate) fn track_and_wrap(
         existing_log_id: meta.existing_log_id,
         log_id: None,
         budget_charge: None,
+        diagnostics: meta.diagnostics,
     });
     Box::pin(stream.map_ok(Frame::data))
 }
