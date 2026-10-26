@@ -81,6 +81,7 @@ pub(crate) struct RequestEvent {
     /// `None` for non-budgeted requests; always `None` in OSS.
     #[allow(dead_code)] // read by cloud telemetry (budget flush), unused in OSS
     pub budget_charge: Option<BudgetCharge>,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 pub(crate) static SENDER: OnceLock<mpsc::Sender<RequestEvent>> = OnceLock::new();
@@ -136,6 +137,7 @@ pub(crate) struct BatchColumns {
     pub statuses: Vec<i32>,
     pub latencies: Vec<i32>,
     pub injections: Vec<i32>,
+    pub extra_data: Vec<String>,
 }
 
 pub(crate) fn extract_columns(events: &[&RequestEvent]) -> BatchColumns {
@@ -157,6 +159,13 @@ pub(crate) fn extract_columns(events: &[&RequestEvent]) -> BatchColumns {
         statuses: events.iter().map(|e| e.status as i32).collect(),
         latencies: events.iter().map(|e| e.latency_ms as i32).collect(),
         injections: events.iter().map(|e| e.injection_count as i32).collect(),
+        extra_data: events
+            .iter()
+            .map(|e| match &e.diagnostics {
+                Some(d) => serde_json::json!({"upstream": d}).to_string(),
+                None => "{}".to_string(),
+            })
+            .collect(),
     }
 }
 
@@ -184,6 +193,7 @@ mod tests {
             existing_log_id: None,
             log_id: None,
             budget_charge: None,
+            diagnostics: None,
         }
     }
 

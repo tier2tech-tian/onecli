@@ -484,6 +484,7 @@ fn emit_telemetry(
             existing_log_id: None,
             log_id: None,
             budget_charge: None,
+        diagnostics: None,
         });
     }
 }

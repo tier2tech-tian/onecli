@@ -14,6 +14,9 @@
 //! - [`response`]: pre-built gateway error responses
 
 mod body;
+mod diagnostics;
+#[cfg(test)]
+mod diagnostics_e2e;
 #[cfg(feature = "cloud")]
 #[path = "cloud/response.rs"]
 mod cloud_response;
