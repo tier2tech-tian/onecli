@@ -209,6 +209,7 @@ model Secret {
   organization    Organization? @relation(fields: [organizationId], references: [id])
   partner         Partner?      @relation(fields: [partnerId], references: [id])
 
+  cooldown SecretCooldown?
   agentSecrets AgentSecret[]
   budgets      Budget[] // cloud-only: spend budgets on this secret (inert in OSS)
 
@@ -574,4 +575,12 @@ model CliAuthSession {
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("cli_auth_sessions")
+}
+
+model SecretCooldown {
+  secretId String @id @map("secret_id")
+  reason String
+  resetAt BigInt @map("reset_at")
+  secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
+  @@map("secret_cooldowns")
 }
