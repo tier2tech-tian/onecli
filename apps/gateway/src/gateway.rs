@@ -30,6 +30,7 @@ pub(crate) mod hooks;
 #[path = "cloud/hooks.rs"]
 pub(crate) mod hooks;
 mod mitm;
+pub(crate) mod quota_usage;
 mod response;
 mod transforms;
 mod tunnel;

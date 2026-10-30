@@ -75,6 +75,8 @@ pub(super) async fn observe(
     path: &str,
     response: &reqwest::Response,
 ) {
+    // 每次模型响应（含 200）顺手把账号实时用量记进内存，后台每分钟用专用连接写库
+    super::quota_usage::record(id, host, path, response);
     if !applies(host, path) || response.status() != StatusCode::TOO_MANY_REQUESTS {
         return;
     }
