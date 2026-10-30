@@ -210,7 +210,7 @@ model Secret {
   partner         Partner?      @relation(fields: [partnerId], references: [id])
 
   cooldown SecretCooldown?
-  quotaUsage SecretQuotaUsage?
+  quotaUsage SecretQuotaUsage[]
   agentSecrets AgentSecret[]
   budgets      Budget[] // cloud-only: spend budgets on this secret (inert in OSS)
 
@@ -586,9 +586,10 @@ model SecretCooldown {
   @@map("secret_cooldowns")
 }
 
-// 网关从模型响应头记下的账号实时额度用量（每账号一行，新观测覆盖旧观测）
+// 网关从模型响应头记下的账号额度用量曲线：每个账号每分钟最多一行，没有请求的分钟不写
 model SecretQuotaUsage {
-  secretId String @id @map("secret_id")
+  secretId String @map("secret_id")
+  minute BigInt
   fiveHourUtilization Float? @map("five_hour_utilization")
   fiveHourReset BigInt? @map("five_hour_reset")
   sevenDayUtilization Float? @map("seven_day_utilization")
@@ -597,5 +598,7 @@ model SecretQuotaUsage {
   httpStatus Int @map("http_status")
   observedAt BigInt @map("observed_at")
   secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
+  @@id([secretId, minute])
+  @@index([minute])
   @@map("secret_quota_usage")
 }

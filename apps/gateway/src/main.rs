@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
     };
     let pool = db::create_pool(&database_url).await?;
     info!("database pool created");
+    gateway::quota_usage::start(&database_url);
     let telemetry_pool = pool.clone();
 
     // Load crypto service for secret decryption
