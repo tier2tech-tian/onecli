@@ -1,34 +1,33 @@
-//! 记录模型账号的实时额度用量（5 小时 / 周）曲线，供监控页展示。
-//! 上游每次 /v1/messages 响应（含 200）都带 `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`。
+//! 记录模型账号的实时额度用量（5 小时 / 周）明细，供监控页画曲线、做统计。
+//! 上游每次 /v1/messages 响应（含 200）都带 `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`，
+//! 每个带用量的响应都记一行。
 //!
-//! 热路径只做一件事：把这个账号的最新观测记进内存（一把短锁，不碰数据库）。
-//! 后台单独一个写入任务、专用 1 个连接的独立连接池，每分钟把这一分钟里有过响应的账号各写一行
-//! （取这一分钟内最后一次观测）。这一分钟没有响应的账号不写。前台连接池完全不被占用，
-//! 冷却读取、请求日志不受影响；写库失败只告警，下一分钟重试。
+//! 性能：热路径只把观测压进内存队列（一把短锁，不碰数据库）。后台单独一个写入任务、
+//! 专用 1 个连接的独立连接池，每 5 秒把队列里攒下的观测用一条多行 INSERT 批量写入。
+//! 前台连接池完全不被占用，冷却读取、请求日志不受影响。
+//! 队列有上限：数据库长时间写不进时丢最旧的、告警，不会把网关内存撑爆。写失败的整批放回，下一轮重试。
 use hyper::HeaderMap;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        LazyLock, Mutex, OnceLock,
-    },
+    collections::VecDeque,
+    sync::{LazyLock, Mutex, OnceLock},
     time::Duration,
 };
 use tracing::{info, warn};
 
-const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
-const DB_TIMEOUT: Duration = Duration::from_secs(5);
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const DB_TIMEOUT: Duration = Duration::from_secs(10);
+/// 一条 INSERT 最多写多少行
+const BATCH: usize = 1000;
+/// 内存里最多攒多少条（约 1.5 万条/天的量，够撑数据库断开好几天）
+const MAX_PENDING: usize = 100_000;
 
-/// 每个账号每分钟一行。同一分钟重复写入（比如刚好跨了两次 flush）时保留更新的观测。
-const UPSERT: &str = "INSERT INTO secret_quota_usage (secret_id, minute, five_hour_utilization, five_hour_reset, \
-     seven_day_utilization, seven_day_reset, unified_status, http_status, observed_at) \
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
-     ON CONFLICT (secret_id, minute) DO UPDATE SET five_hour_utilization=EXCLUDED.five_hour_utilization, \
-     five_hour_reset=EXCLUDED.five_hour_reset, seven_day_utilization=EXCLUDED.seven_day_utilization, \
-     seven_day_reset=EXCLUDED.seven_day_reset, unified_status=EXCLUDED.unified_status, \
-     http_status=EXCLUDED.http_status, observed_at=EXCLUDED.observed_at \
-     WHERE secret_quota_usage.observed_at <= EXCLUDED.observed_at";
+/// 批量写入：数组展开成多行。账号已被删除的行跳过（不让整批因外键失败）。
+const INSERT: &str = "INSERT INTO secret_quota_usage (secret_id, observed_at, five_hour_utilization, five_hour_reset, \
+     seven_day_utilization, seven_day_reset, unified_status, http_status) \
+     SELECT u.* FROM UNNEST($1::text[], $2::bigint[], $3::float8[], $4::bigint[], $5::float8[], $6::bigint[], $7::text[], $8::int4[]) \
+       AS u(secret_id, observed_at, five_hour_utilization, five_hour_reset, seven_day_utilization, seven_day_reset, unified_status, http_status) \
+     WHERE EXISTS (SELECT 1 FROM secrets s WHERE s.id = u.secret_id)";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct QuotaUsage {
@@ -78,31 +77,30 @@ pub(super) fn parse(headers: &HeaderMap) -> Option<QuotaUsage> {
 
 #[derive(Debug, Clone, PartialEq)]
 struct Observation {
+    secret_id: String,
     usage: QuotaUsage,
     http_status: i32,
     /// 观测时刻（毫秒）
     observed_at: i64,
-    /// 进程内单调序号：同一毫秒到达的两条也能分先后
-    seq: u64,
 }
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-/// 还没写库的观测：每个账号只留最新一条（写完即清）
-static PENDING: LazyLock<Mutex<HashMap<String, Observation>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PENDING: LazyLock<Mutex<VecDeque<Observation>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
 static STARTED: OnceLock<()> = OnceLock::new();
 
-fn remember(id: &str, obs: Observation) {
-    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    match pending.get(id) {
-        Some(old) if old.seq > obs.seq => {}
-        _ => {
-            pending.insert(id.to_owned(), obs);
-        }
+/// 入队；超过上限丢最旧的。返回丢掉的条数。
+fn push(obs: Observation) -> usize {
+    let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    q.push_back(obs);
+    let mut dropped = 0;
+    while q.len() > MAX_PENDING {
+        q.pop_front();
+        dropped += 1;
     }
+    dropped
 }
 
-/// 热路径：只读响应头、记内存，不碰数据库
+/// 热路径：只读响应头、入内存队列，不碰数据库
 pub(super) fn record(id: Option<&str>, host: &str, path: &str, response: &reqwest::Response) {
     if !super::cooldown::applies(host, path) {
         return;
@@ -113,64 +111,81 @@ pub(super) fn record(id: Option<&str>, host: &str, path: &str, response: &reqwes
     let Some(usage) = parse(response.headers()) else {
         return;
     };
-    let observed_at = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
-    remember(
-        id,
-        Observation {
-            usage,
-            http_status: response.status().as_u16() as i32,
-            observed_at,
-            seq: SEQ.fetch_add(1, Ordering::Relaxed),
-        },
-    );
+    let dropped = push(Observation {
+        secret_id: id.to_owned(),
+        usage,
+        http_status: response.status().as_u16() as i32,
+        observed_at: (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
+    });
+    if dropped > 0 {
+        warn!(
+            dropped,
+            reason = "quota_usage_queue_full",
+            "额度用量队列已满，丢弃最旧记录"
+        );
+    }
 }
 
-/// 把内存里待写的观测各写一行（按观测所在的分钟归桶）。写失败的放回去，下一轮重试；
-/// 放回时如果期间又来了更新的观测，以更新的为准。
-async fn flush(pool: &PgPool) -> usize {
-    let batch: Vec<(String, Observation)> = {
-        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        pending.drain().collect()
-    };
+/// 把队列里攒下的观测分批写库，返回写入行数。某批失败就把这批及之后的放回队头，下一轮重试。
+async fn flush(pool: &PgPool) -> u64 {
     let mut written = 0;
-    for (id, obs) in batch {
-        let minute = obs.observed_at / 60_000 * 60;
+    loop {
+        let batch: Vec<Observation> = {
+            let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            let n = q.len().min(BATCH);
+            q.drain(..n).collect()
+        };
+        if batch.is_empty() {
+            return written;
+        }
+        let col = |f: fn(&Observation) -> Option<f64>| batch.iter().map(f).collect::<Vec<_>>();
+        let coli = |f: fn(&Observation) -> Option<i64>| batch.iter().map(f).collect::<Vec<_>>();
         let result = tokio::time::timeout(
             DB_TIMEOUT,
-            sqlx::query(UPSERT)
-                .bind(&id)
-                .bind(minute)
-                .bind(obs.usage.five_hour_utilization)
-                .bind(obs.usage.five_hour_reset)
-                .bind(obs.usage.seven_day_utilization)
-                .bind(obs.usage.seven_day_reset)
-                .bind(obs.usage.status.clone())
-                .bind(obs.http_status)
-                .bind(obs.observed_at)
+            sqlx::query(INSERT)
+                .bind(
+                    batch
+                        .iter()
+                        .map(|o| o.secret_id.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .bind(batch.iter().map(|o| o.observed_at).collect::<Vec<_>>())
+                .bind(col(|o| o.usage.five_hour_utilization))
+                .bind(coli(|o| o.usage.five_hour_reset))
+                .bind(col(|o| o.usage.seven_day_utilization))
+                .bind(coli(|o| o.usage.seven_day_reset))
+                .bind(
+                    batch
+                        .iter()
+                        .map(|o| o.usage.status.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .bind(batch.iter().map(|o| o.http_status).collect::<Vec<_>>())
                 .execute(pool),
         )
         .await;
         match result {
-            Ok(Ok(_)) => written += 1,
-            Ok(Err(e)) if is_missing_secret(&e) => {
-                // 账号已删除：外键拒绝，丢弃这条，不重试
-            }
+            Ok(Ok(r)) => written += r.rows_affected(),
             _ => {
-                warn!(secret_id = %id, reason = "quota_usage_write_failed", "额度用量写入失败，下一分钟重试，不影响转发");
-                remember(&id, obs);
+                warn!(
+                    rows = batch.len(),
+                    reason = "quota_usage_write_failed",
+                    "额度用量写入失败，下一轮重试，不影响转发"
+                );
+                let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+                for obs in batch.into_iter().rev() {
+                    q.push_front(obs);
+                }
+                while q.len() > MAX_PENDING {
+                    q.pop_front();
+                }
+                return written;
             }
         }
     }
-    written
 }
 
-fn is_missing_secret(e: &sqlx::Error) -> bool {
-    e.as_database_error()
-        .is_some_and(|d| d.is_foreign_key_violation())
-}
-
-/// 启动后台写入：独立连接池（最多 1 个连接、懒连接，数据库暂时不可用也不影响网关启动）。
-/// 只启动一次。
+/// 启动后台写入：独立连接池（最多 1 个连接、懒连接，数据库暂时不可用也不影响网关启动）。只启动一次。
 pub(crate) fn start(database_url: &str) {
     if STARTED.set(()).is_err() {
         return;
@@ -186,7 +201,7 @@ pub(crate) fn start(database_url: &str) {
             return;
         }
     };
-    info!("额度用量记录已启动：每分钟写一次，专用 1 个数据库连接");
+    info!("额度用量记录已启动：每条请求都记，每 5 秒批量写库，专用 1 个数据库连接");
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -274,7 +289,7 @@ mod tests {
 #[cfg(test)]
 #[tokio::test]
 #[ignore = "需要专用隔离库 COOLDOWN_TEST_DATABASE_URL"]
-async fn one_row_per_account_per_minute() {
+async fn every_response_recorded_in_batches() {
     let url = std::env::var("COOLDOWN_TEST_DATABASE_URL").expect("只允许隔离测试库");
     let pool = PgPool::connect(&url).await.unwrap();
     sqlx::raw_sql("CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY); DROP TABLE IF EXISTS secret_quota_usage;")
@@ -291,6 +306,7 @@ async fn one_row_per_account_per_minute() {
         .execute(&pool)
         .await
         .unwrap();
+    PENDING.lock().unwrap().clear();
     let response = |util: &str| {
         reqwest::Response::from(
             hyper::Response::builder()
@@ -303,14 +319,12 @@ async fn one_row_per_account_per_minute() {
                 .unwrap(),
         )
     };
-    let rows = || async {
-        sqlx::query_as::<_, (String, i64, Option<f64>, Option<f64>, Option<i64>, Option<String>, i32)>(
-            "SELECT secret_id, minute, five_hour_utilization, seven_day_utilization, seven_day_reset, unified_status, http_status \
-             FROM secret_quota_usage ORDER BY secret_id, minute",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap()
+    let count = || async {
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM secret_quota_usage")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .0
     };
     // 走真实入口 cooldown::observe（转发三处都调它）。非模型接口、没有账号 id：都不记
     super::cooldown::observe(
@@ -329,7 +343,6 @@ async fn one_row_per_account_per_minute() {
         &response("0.9"),
     )
     .await;
-    // 同一分钟内 q1 来了三次：只留最后一次；q2 一次
     for util in ["0.5", "0.6", "0.7"] {
         super::cooldown::observe(
             &pool,
@@ -349,51 +362,52 @@ async fn one_row_per_account_per_minute() {
     )
     .await;
     // 热路径不写库
-    assert!(rows().await.is_empty());
-    assert_eq!(flush(&pool).await, 2);
-    let got = rows().await;
-    assert_eq!(got.len(), 2);
+    assert_eq!(count().await, 0);
+    assert_eq!(PENDING.lock().unwrap().len(), 4);
+    // 每条都记，顺序与值都在
+    assert_eq!(flush(&pool).await, 4);
+    let q1: Vec<(Option<f64>, Option<f64>, Option<i64>, Option<String>, i32)> = sqlx::query_as(
+        "SELECT five_hour_utilization, seven_day_utilization, seven_day_reset, unified_status, http_status \
+         FROM secret_quota_usage WHERE secret_id='q1' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        (got[0].0.as_str(), got[0].3, got[0].4, got[0].6),
-        ("q1", Some(0.7), Some(1793500000), 200)
+        q1.iter().map(|r| r.1).collect::<Vec<_>>(),
+        vec![Some(0.5), Some(0.6), Some(0.7)]
     );
-    assert_eq!(got[0].1 % 60, 0);
-    assert_eq!((got[1].0.as_str(), got[1].3), ("q2", Some(0.3)));
-    // 这一分钟没有新响应：不写
+    assert_eq!(
+        q1[2],
+        (
+            Some(0.25),
+            Some(0.7),
+            Some(1793500000),
+            Some("allowed".into()),
+            200
+        )
+    );
+    // 队列空了：再 flush 不写
     assert_eq!(flush(&pool).await, 0);
-    assert_eq!(rows().await.len(), 2);
-    // 同一分钟桶里迟到的旧观测不覆盖
-    sqlx::query(UPSERT)
-        .bind("q1")
-        .bind(got[0].1)
-        .bind(None::<f64>)
-        .bind(None::<i64>)
-        .bind(Some(0.1))
-        .bind(None::<i64>)
-        .bind(None::<String>)
-        .bind(200)
-        .bind(1_i64)
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(rows().await[0].3, Some(0.7));
-    // 下一分钟的观测是新的一行
-    remember(
-        "q1",
-        Observation {
-            usage: parse(response("0.8").headers()).unwrap(),
-            http_status: 200,
-            observed_at: (got[0].1 + 60) * 1000 + 5,
-            seq: SEQ.fetch_add(1, Ordering::Relaxed),
-        },
-    );
-    assert_eq!(flush(&pool).await, 1);
-    assert_eq!(rows().await.len(), 3);
-    // 账号删了：用量级联删除；之后到来的观测写不进去也不重试
+    // 多于一批：2500 条分 3 批写完
+    for _ in 0..2500 {
+        super::cooldown::observe(
+            &pool,
+            Some("q2"),
+            "api.anthropic.com",
+            "/v1/messages",
+            &response("0.4"),
+        )
+        .await;
+    }
+    assert_eq!(flush(&pool).await, 2500);
+    assert_eq!(count().await, 2504);
+    // 已删除账号的观测跳过，不让整批失败；同批其他账号照常写入
     sqlx::query("DELETE FROM secrets WHERE id='q2'")
         .execute(&pool)
         .await
         .unwrap();
+    assert_eq!(count().await, 3, "删账号连带删其用量");
     super::cooldown::observe(
         &pool,
         Some("q2"),
@@ -402,43 +416,80 @@ async fn one_row_per_account_per_minute() {
         &response("0.4"),
     )
     .await;
+    super::cooldown::observe(
+        &pool,
+        Some("q1"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &response("0.8"),
+    )
+    .await;
+    assert_eq!(flush(&pool).await, 1);
+    assert_eq!(count().await, 4);
+    // 写失败：整批放回，顺序不变，下一轮补写
+    sqlx::raw_sql("ALTER TABLE secret_quota_usage RENAME TO secret_quota_usage_off")
+        .execute(&pool)
+        .await
+        .unwrap();
+    super::cooldown::observe(
+        &pool,
+        Some("q1"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &response("0.81"),
+    )
+    .await;
+    super::cooldown::observe(
+        &pool,
+        Some("q1"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &response("0.82"),
+    )
+    .await;
     assert_eq!(flush(&pool).await, 0);
-    assert!(PENDING.lock().unwrap().get("q2").is_none());
-    assert!(rows().await.iter().all(|r| r.0 == "q1"));
+    assert_eq!(PENDING.lock().unwrap().len(), 2);
+    sqlx::raw_sql("ALTER TABLE secret_quota_usage_off RENAME TO secret_quota_usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    super::cooldown::observe(
+        &pool,
+        Some("q1"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &response("0.83"),
+    )
+    .await;
+    assert_eq!(flush(&pool).await, 3);
+    let tail: Vec<(Option<f64>,)> = sqlx::query_as(
+        "SELECT seven_day_utilization FROM secret_quota_usage WHERE secret_id='q1' ORDER BY id DESC LIMIT 3",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tail, vec![(Some(0.83),), (Some(0.82),), (Some(0.81),)]);
 }
 
 #[test]
-fn newer_seq_wins_in_memory() {
-    let obs = |util: f64, seq: u64| Observation {
-        usage: QuotaUsage {
-            seven_day_utilization: Some(util),
-            ..Default::default()
-        },
+fn queue_is_bounded_and_drops_oldest() {
+    let mk = |i: i64| Observation {
+        secret_id: "cap".into(),
+        usage: QuotaUsage::default(),
         http_status: 200,
-        observed_at: 1000,
-        seq,
+        observed_at: i,
     };
-    remember("mem", obs(0.5, 10));
-    remember("mem", obs(0.4, 9)); // 同毫秒、更早到达
-    assert_eq!(
-        PENDING
-            .lock()
-            .unwrap()
-            .get("mem")
-            .unwrap()
-            .usage
-            .seven_day_utilization,
-        Some(0.5)
-    );
-    remember("mem", obs(0.6, 11));
-    assert_eq!(
-        PENDING
-            .lock()
-            .unwrap()
-            .remove("mem")
-            .unwrap()
-            .usage
-            .seven_day_utilization,
-        Some(0.6)
-    );
+    let mut q: VecDeque<Observation> = VecDeque::new();
+    std::mem::swap(&mut q, &mut PENDING.lock().unwrap());
+    let mut dropped = 0;
+    for i in 0..(MAX_PENDING as i64 + 3) {
+        dropped += push(mk(i));
+    }
+    {
+        let p = PENDING.lock().unwrap();
+        assert_eq!(dropped, 3);
+        assert_eq!(p.len(), MAX_PENDING);
+        assert_eq!(p.front().unwrap().observed_at, 3);
+    }
+    std::mem::swap(&mut q, &mut PENDING.lock().unwrap());
 }

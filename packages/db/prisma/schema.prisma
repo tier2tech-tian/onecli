@@ -586,19 +586,19 @@ model SecretCooldown {
   @@map("secret_cooldowns")
 }
 
-// 网关从模型响应头记下的账号额度用量曲线：每个账号每分钟最多一行，没有请求的分钟不写
+// 网关从模型响应头记下的账号额度用量明细：每个带用量头的模型响应一行（追加写，每 5 秒批量写入）
 model SecretQuotaUsage {
+  id BigInt @id @default(autoincrement())
   secretId String @map("secret_id")
-  minute BigInt
+  observedAt BigInt @map("observed_at")
   fiveHourUtilization Float? @map("five_hour_utilization")
   fiveHourReset BigInt? @map("five_hour_reset")
   sevenDayUtilization Float? @map("seven_day_utilization")
   sevenDayReset BigInt? @map("seven_day_reset")
   unifiedStatus String? @map("unified_status")
   httpStatus Int @map("http_status")
-  observedAt BigInt @map("observed_at")
   secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
-  @@id([secretId, minute])
-  @@index([minute])
+  @@index([secretId, observedAt])
+  @@index([observedAt])
   @@map("secret_quota_usage")
 }
