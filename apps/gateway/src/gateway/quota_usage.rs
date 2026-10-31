@@ -7,7 +7,7 @@
 //! 前台连接池完全不被占用，冷却读取、请求日志不受影响。
 //! 队列有上限：数据库长时间写不进时丢最旧的、告警，不会把网关内存撑爆。写失败的整批放回，下一轮重试。
 //!
-//! token 用量（10-31）：成功回复（2xx、带上游 `request-id`）的观测先按 request-id 暂存，
+//! token 用量（10-31）：成功回复（2xx）的观测先按网关自己的请求编号（每次转发唯一的 UUID）暂存，
 //! 等 `token_usage` 旁路读完回复正文再连同 token 数一起入队，同一行写库；`observed_at` 仍是收到回复头的时刻。
 //! 暂存有上限，超过 30 分钟没人认领（比如回复没走到转发出口）的按无 token 入队，保证额度那几列不丢。
 use hyper::HeaderMap;
@@ -102,13 +102,17 @@ pub(super) struct Observation {
 static PENDING: LazyLock<Mutex<VecDeque<Observation>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
 static STARTED: OnceLock<()> = OnceLock::new();
-/// 等 token 的观测：上游 request-id → (暂存时刻, 观测)
-static HELD: LazyLock<Mutex<HashMap<String, (Instant, Observation)>>> =
+/// 等 token 的观测：网关请求编号 → (暂存时刻, 观测)。不用上游 request-id，避免外部值重复时认领错（6号 P2）
+static HELD: LazyLock<Mutex<HashMap<u128, (Instant, Observation)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 入队；超过上限丢最旧的。返回丢掉的条数。
 fn push(obs: Observation) -> usize {
     let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    push_bounded(&mut q, obs)
+}
+
+fn push_bounded(q: &mut VecDeque<Observation>, obs: Observation) -> usize {
     q.push_back(obs);
     let mut dropped = 0;
     while q.len() > MAX_PENDING {
@@ -129,21 +133,22 @@ fn push_logged(obs: Observation) {
     }
 }
 
-/// 暂存等 token；暂存满了或 request-id 重复就交回调用方直接入队
-fn hold(request_id: &str, obs: Observation) -> Option<Observation> {
+/// 暂存等 token；暂存满了或编号重复就交回调用方直接入队
+fn hold(request_id: uuid::Uuid, obs: Observation) -> Option<Observation> {
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-    if held.len() >= MAX_HELD || held.contains_key(request_id) {
+    let key = request_id.as_u128();
+    if held.len() >= MAX_HELD || held.contains_key(&key) {
         return Some(obs);
     }
-    held.insert(request_id.to_owned(), (Instant::now(), obs));
+    held.insert(key, (Instant::now(), obs));
     None
 }
 
 /// 转发出口认领暂存的观测（token 旁路用）
-pub(super) fn take_held(request_id: &str) -> Option<Observation> {
+pub(super) fn take_held(request_id: uuid::Uuid) -> Option<Observation> {
     HELD.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(request_id)
+        .remove(&request_id.as_u128())
         .map(|(_, obs)| obs)
 }
 
@@ -167,10 +172,10 @@ pub(super) fn drain_for_test(secret_id: &str) -> Vec<Option<TokenUsage>> {
 fn sweep_held(max_age: Duration) -> usize {
     let expired: Vec<Observation> = {
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<String> = held
+        let keys: Vec<u128> = held
             .iter()
             .filter(|(_, (at, _))| at.elapsed() >= max_age)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| *k)
             .collect();
         keys.iter()
             .filter_map(|k| held.remove(k))
@@ -185,7 +190,13 @@ fn sweep_held(max_age: Duration) -> usize {
 }
 
 /// 热路径：只读响应头、入内存队列（或暂存等 token），不碰数据库
-pub(super) fn record(id: Option<&str>, host: &str, path: &str, response: &reqwest::Response) {
+pub(super) fn record(
+    id: Option<&str>,
+    host: &str,
+    path: &str,
+    response: &reqwest::Response,
+    request_id: Option<uuid::Uuid>,
+) {
     if !super::cooldown::applies(host, path) {
         return;
     }
@@ -202,12 +213,8 @@ pub(super) fn record(id: Option<&str>, host: &str, path: &str, response: &reqwes
         observed_at: (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
         tokens: None,
     };
-    // 只有成功回复会原样转发给调用方、正文里才有用量；429 等轮换掉的回复直接入队
-    let request_id = response
-        .headers()
-        .get("request-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty());
+    // 只有成功回复会原样转发给调用方、正文里才有用量；429 等轮换掉的回复直接入队。
+    // 一次转发里成功回复至多一个，所以网关请求编号能唯一对上转发出口的那条回复。
     let obs = match request_id {
         Some(rid) if response.status().is_success() => hold(rid, obs),
         _ => Some(obs),
@@ -447,6 +454,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/models",
         &response("0.9"),
+        None,
     )
     .await;
     super::cooldown::observe(
@@ -455,6 +463,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.9"),
+        None,
     )
     .await;
     for util in ["0.5", "0.6", "0.7"] {
@@ -464,6 +473,7 @@ async fn every_response_recorded_in_batches() {
             "api.anthropic.com:443",
             "/v1/messages?beta=true",
             &response(util),
+            None,
         )
         .await;
     }
@@ -473,6 +483,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.3"),
+        None,
     )
     .await;
     // 热路径不写库
@@ -511,6 +522,7 @@ async fn every_response_recorded_in_batches() {
             "api.anthropic.com",
             "/v1/messages",
             &response("0.4"),
+            None,
         )
         .await;
     }
@@ -528,6 +540,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.4"),
+        None,
     )
     .await;
     super::cooldown::observe(
@@ -536,6 +549,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.8"),
+        None,
     )
     .await;
     assert_eq!(flush(&pool).await, 1);
@@ -551,6 +565,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.81"),
+        None,
     )
     .await;
     super::cooldown::observe(
@@ -559,6 +574,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.82"),
+        None,
     )
     .await;
     assert_eq!(flush(&pool).await, 0);
@@ -573,6 +589,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.83"),
+        None,
     )
     .await;
     assert_eq!(flush(&pool).await, 3);
@@ -584,18 +601,26 @@ async fn every_response_recorded_in_batches() {
     .unwrap();
     assert_eq!(tail, vec![(Some(0.83),), (Some(0.82),), (Some(0.81),)]);
     // token 用量：成功回复暂存 → 认领填 token → 与额度同一行写入；老行 token 列为空
+    let rid = uuid::Uuid::new_v4();
     let ok = reqwest::Response::from(
         hyper::Response::builder()
             .status(200)
-            .header("request-id", "req_e2e_tokens")
             .header("anthropic-ratelimit-unified-5h-utilization", "0.11")
             .body(Vec::<u8>::new())
             .unwrap(),
     );
-    super::cooldown::observe(&pool, Some("q1"), "api.anthropic.com", "/v1/messages", &ok).await;
+    super::cooldown::observe(
+        &pool,
+        Some("q1"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &ok,
+        Some(rid),
+    )
+    .await;
     assert_eq!(flush(&pool).await, 0, "等 token 期间不写");
     complete(
-        take_held("req_e2e_tokens").unwrap(),
+        take_held(rid).unwrap(),
         Some(TokenUsage {
             model: Some("claude-haiku-4-5-20251001".into()),
             input_tokens: Some(18),
@@ -642,40 +667,40 @@ async fn every_response_recorded_in_batches() {
 
 #[test]
 fn held_until_claimed_or_expired() {
-    let resp = |status: u16, rid: Option<&str>| {
-        let mut b = hyper::Response::builder()
-            .status(status)
-            .header("anthropic-ratelimit-unified-7d-utilization", "0.5");
-        if let Some(r) = rid {
-            b = b.header("request-id", r);
-        }
-        reqwest::Response::from(b.body(Vec::<u8>::new()).unwrap())
+    let resp = |status: u16| {
+        reqwest::Response::from(
+            hyper::Response::builder()
+                .status(status)
+                .header("anthropic-ratelimit-unified-7d-utilization", "0.5")
+                .body(Vec::<u8>::new())
+                .unwrap(),
+        )
     };
-    // 成功 + 有 request-id：暂存，不入队
-    record(
-        Some("hold1"),
-        "api.anthropic.com",
-        "/v1/messages",
-        &resp(200, Some("rid_h1")),
+    let (r1, r2, r3) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
     );
+    let rec = |secret: &str, status: u16, rid: Option<uuid::Uuid>| {
+        record(
+            Some(secret),
+            "api.anthropic.com",
+            "/v1/messages",
+            &resp(status),
+            rid,
+        )
+    };
+    // 成功 + 有网关请求编号：暂存，不入队
+    rec("hold1", 200, Some(r1));
     assert!(drain_for_test("hold1").is_empty());
-    // 429（会被轮换掉）、没有 request-id：直接入队
-    record(
-        Some("hold1"),
-        "api.anthropic.com",
-        "/v1/messages",
-        &resp(429, Some("rid_h2")),
-    );
-    record(
-        Some("hold1"),
-        "api.anthropic.com",
-        "/v1/messages",
-        &resp(200, None),
-    );
+    // 429（会被轮换掉）、没有请求编号：直接入队
+    rec("hold1", 429, Some(r2));
+    rec("hold1", 200, None);
     assert_eq!(drain_for_test("hold1"), vec![None, None]);
-    // 认领后填 token 入队
-    let obs = take_held("rid_h1").unwrap();
-    assert!(take_held("rid_h1").is_none(), "只能认领一次");
+    // 认领后填 token 入队；只能认领一次
+    let obs = take_held(r1).unwrap();
+    assert!(take_held(r1).is_none(), "只能认领一次");
+    assert!(take_held(r2).is_none(), "429 没暂存");
     let t = TokenUsage {
         output_tokens: Some(9),
         ..Default::default()
@@ -683,25 +708,21 @@ fn held_until_claimed_or_expired() {
     complete(obs, Some(t.clone()));
     assert_eq!(drain_for_test("hold1"), vec![Some(t)]);
     // 没人认领：超时按无 token 入队
-    record(
-        Some("hold2"),
-        "api.anthropic.com",
-        "/v1/messages",
-        &resp(200, Some("rid_h3")),
-    );
+    rec("hold2", 200, Some(r3));
     sweep_held(HOLD_MAX);
     assert!(drain_for_test("hold2").is_empty(), "没超时不动");
     // 只把这一条的暂存时刻拨到超时前（不用 ZERO 全扫，免得扫走并行测试的暂存）
-    if let Some(entry) = HELD.lock().unwrap().get_mut("rid_h3") {
+    if let Some(entry) = HELD.lock().unwrap().get_mut(&r3.as_u128()) {
         entry.0 = Instant::now().checked_sub(HOLD_MAX * 2).unwrap();
     }
     sweep_held(HOLD_MAX);
     assert_eq!(drain_for_test("hold2"), vec![None]);
-    assert!(take_held("rid_h3").is_none());
+    assert!(take_held(r3).is_none());
 }
 
 #[test]
 fn queue_is_bounded_and_drops_oldest() {
+    // 用本地队列测上限，不碰全局 PENDING（6号 P2：并行测试互扰）
     let mk = |i: i64| Observation {
         secret_id: "cap".into(),
         usage: QuotaUsage::default(),
@@ -710,16 +731,11 @@ fn queue_is_bounded_and_drops_oldest() {
         tokens: None,
     };
     let mut q: VecDeque<Observation> = VecDeque::new();
-    std::mem::swap(&mut q, &mut PENDING.lock().unwrap());
     let mut dropped = 0;
     for i in 0..(MAX_PENDING as i64 + 3) {
-        dropped += push(mk(i));
+        dropped += push_bounded(&mut q, mk(i));
     }
-    {
-        let p = PENDING.lock().unwrap();
-        assert_eq!(dropped, 3);
-        assert_eq!(p.len(), MAX_PENDING);
-        assert_eq!(p.front().unwrap().observed_at, 3);
-    }
-    std::mem::swap(&mut q, &mut PENDING.lock().unwrap());
+    assert_eq!(dropped, 3);
+    assert_eq!(q.len(), MAX_PENDING);
+    assert_eq!(q.front().unwrap().observed_at, 3);
 }

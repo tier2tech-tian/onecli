@@ -1,33 +1,49 @@
 //! 旁路读取模型回复里的 token 用量，补进同一条额度用量记录（`quota_usage`）。
 //!
-//! 隔离原则（大杰 10-31：出异常不能影响主流程、不能把网关搞挂）：
-//! - 转发路径上只做一件事：把每段回复的 `Bytes` 引用计数克隆一份、`try_send` 给旁路任务。
-//!   不改、不拦、不等任何字节；旁路队列满或已关就停止投递，转发照旧。
-//! - 解压、拆行、解析 JSON 全在独立的旁路任务里做。解析失败、数据不完整、压缩格式不认识，
-//!   一律只是"这条记录没有 token 数"，额度那几列照常写。
+//! 隔离原则（大杰 10-31：出异常不能影响主流程、不能把网关搞挂；6号评审两项 P1 后重做）：
+//! - 转发路径上只做两件事：`Bytes` 引用计数克隆 + 非阻塞 `send` 给一个**独立系统线程**（不是 Tokio 任务）。
+//!   不改、不拦、不等任何字节，也不在 Tokio 工作线程上做解压/解析，转发调度不受影响。
+//! - 全部有全局硬上限，超了就放弃这条的 token 统计（额度列照常写）：同时统计的回复数 `MAX_ACTIVE`、
+//!   所有回复已投递未解析的字节 `MAX_INFLIGHT`、每条解压总量 `MAX_DECODED`、每段解压输出 `MAX_FEED_OUT`
+//!   （写入前检查，不先分配再检查）、SSE 单行 `MAX_LINE`、非流式 JSON `MAX_JSON`。
+//!   最坏内存 ≈ MAX_INFLIGHT + MAX_ACTIVE ×（MAX_JSON 或 MAX_LINE + 解压器约 64KB）≈ 300MB，日常是 KB 级。
+//! - 解析失败、数据不完整、压缩格式不认识、旁路线程起不来：一律只是"这条没有 token 数"。
 //! - 网关 release 编译是 `panic = "abort"`，`catch_unwind` 兜不住，所以本模块按"不可能 panic"写：
-//!   不用 unwrap / expect / 下标切片，数值一律 checked / saturating，锁中毒照常取用，缓冲区全部有上限。
+//!   不用 unwrap / expect / 下标切片，数值一律 saturating，缓冲区全部有上限。
 //!
 //! 数据来源（10-31 经网关实测）：Claude Code 带 `Accept-Encoding: gzip, deflate, br, zstd`，
 //! Anthropic 回 `Content-Encoding: gzip` 的 SSE。用量在 `message_start.message.usage`（输入/缓存）
 //! 和 `message_delta.usage`（累计值，含输出）里；非流式回复是整段 JSON 的顶层 `usage`。
-use futures_util::StreamExt;
-use hyper::body::Bytes;
+use futures_util::Stream;
+use hyper::body::{Bytes, Frame};
 use hyper::HeaderMap;
-use std::io::Write;
-use tokio::sync::mpsc;
-use tracing::debug;
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc, OnceLock,
+    },
+    task::{Context, Poll},
+};
+use tracing::{debug, info, warn};
 
 use super::hooks::BodyStream;
+use super::quota_usage::Observation;
 
-/// 旁路队列能积压多少段（一段通常几百字节到几 KB）；满了说明旁路跟不上，直接放弃这条的 token
-const CHANNEL_CAP: usize = 256;
-/// 解压后最多看多少字节，防压缩炸弹
+/// 同时统计 token 的回复数上限；超了新回复只记额度
+const MAX_ACTIVE: usize = 256;
+/// 所有回复已投递给旁路线程、还没解析完的字节上限；超了放弃当前这条
+const MAX_INFLIGHT: usize = 32 * 1024 * 1024;
+/// 每条回复解压后最多看多少字节，防压缩炸弹
 const MAX_DECODED: usize = 64 * 1024 * 1024;
+/// 一段压缩数据最多解压出多少（写入前检查）
+const MAX_FEED_OUT: usize = 4 * 1024 * 1024;
 /// SSE 单行最长；超长行（正文大块文字）直接跳过，不会是用量行
-const MAX_LINE: usize = 1024 * 1024;
+const MAX_LINE: usize = 256 * 1024;
 /// 非流式 JSON 最多缓存多少
-const MAX_JSON: usize = 4 * 1024 * 1024;
+const MAX_JSON: usize = 1024 * 1024;
 
 /// 一条回复的 token 用量。字段缺失就是 None。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -99,9 +115,38 @@ impl TokenUsage {
     }
 }
 
+/// 解压输出的落点：写入**前**检查上限，超了直接报错、不扩容（6号 P1-1：不先分配再检查）
+struct CappedSink {
+    buf: Vec<u8>,
+    total: usize,
+}
+
+impl Write for CappedSink {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let total = self.total.saturating_add(data.len());
+        if total > MAX_DECODED || self.buf.len().saturating_add(data.len()) > MAX_FEED_OUT {
+            return Err(io::Error::other("token 旁路解压超出上限"));
+        }
+        self.buf.extend_from_slice(data);
+        self.total = total;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 enum Decoder {
-    Identity,
-    Gzip(Box<flate2::write::GzDecoder<Vec<u8>>>),
+    Identity { seen: usize },
+    Gzip(Box<flate2::write::GzDecoder<CappedSink>>),
+}
+
+fn gzip_decoder() -> Decoder {
+    Decoder::Gzip(Box::new(flate2::write::GzDecoder::new(CappedSink {
+        buf: Vec::new(),
+        total: 0,
+    })))
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -110,14 +155,13 @@ enum Format {
     Json,
 }
 
-/// 纯同步的解析器：喂压缩/未压缩的分段，产出用量。任何异常只把自己标成 broken。
+/// 纯同步的解析器：喂压缩/未压缩的分段，产出用量。任何异常只把自己标成 broken 并释放缓冲。
 struct Parser {
     decoder: Decoder,
     format: Format,
     buf: Vec<u8>,
     /// 当前行超长，丢到下一个换行为止
     skipping_line: bool,
-    decoded: usize,
     broken: bool,
     usage: TokenUsage,
 }
@@ -129,39 +173,51 @@ impl Parser {
             format,
             buf: Vec::new(),
             skipping_line: false,
-            decoded: 0,
             broken: false,
             usage: TokenUsage::default(),
         }
+    }
+
+    /// 出错：标记并立即释放解压器和缓冲
+    fn fail(&mut self) {
+        self.broken = true;
+        self.decoder = Decoder::Identity { seen: 0 };
+        self.buf = Vec::new();
     }
 
     fn feed(&mut self, chunk: &[u8]) {
         if self.broken {
             return;
         }
-        let plain = match &mut self.decoder {
-            Decoder::Identity => chunk.to_vec(),
+        match &mut self.decoder {
+            Decoder::Identity { seen } => {
+                *seen = seen.saturating_add(chunk.len());
+                if *seen > MAX_DECODED {
+                    self.fail();
+                    return;
+                }
+                self.consume(chunk);
+            }
             Decoder::Gzip(d) => {
                 if d.write_all(chunk).is_err() {
-                    self.broken = true;
+                    self.fail();
                     return;
                 }
-                std::mem::take(d.get_mut())
+                let plain = std::mem::take(&mut d.get_mut().buf);
+                self.consume(&plain);
             }
-        };
-        self.decoded = self.decoded.saturating_add(plain.len());
-        if self.decoded > MAX_DECODED {
-            self.broken = true;
-            return;
         }
+    }
+
+    fn consume(&mut self, plain: &[u8]) {
         match self.format {
-            Format::Sse => self.feed_sse(&plain),
+            Format::Sse => self.feed_sse(plain),
             Format::Json => {
                 if self.buf.len().saturating_add(plain.len()) > MAX_JSON {
-                    self.broken = true;
+                    self.fail();
                     return;
                 }
-                self.buf.extend_from_slice(&plain);
+                self.buf.extend_from_slice(plain);
             }
         }
     }
@@ -189,7 +245,7 @@ impl Parser {
                 None => {
                     if !self.skipping_line {
                         if self.buf.len().saturating_add(data.len()) > MAX_LINE {
-                            self.buf.clear();
+                            self.buf = Vec::new();
                             self.skipping_line = true;
                         } else {
                             self.buf.extend_from_slice(data);
@@ -214,36 +270,33 @@ impl Parser {
         }
     }
 
-    /// 回复结束（或客户端断开）。返回有数的用量；一个数都没有就 None。
+    /// 回复结束（或客户端断开）。返回有数的用量；出过错或一个数都没有就 None。
     fn finish(mut self) -> Option<TokenUsage> {
-        if !self.broken {
-            if let Decoder::Gzip(d) = &mut self.decoder {
-                // 把解压器里剩余的吐出来；流被截断时这里会报错，已解析的照样算
-                if d.try_finish().is_ok() {
-                    let rest = std::mem::take(d.get_mut());
-                    match self.format {
-                        Format::Sse => self.feed_sse(&rest),
-                        Format::Json => {
-                            if self.buf.len().saturating_add(rest.len()) <= MAX_JSON {
-                                self.buf.extend_from_slice(&rest);
-                            }
-                        }
-                    }
+        if self.broken {
+            return None;
+        }
+        if let Decoder::Gzip(d) = &mut self.decoder {
+            // 把解压器里剩余的吐出来（同样受上限约束）；流被截断时这里会报错，已解析的照样算
+            if d.try_finish().is_ok() {
+                let rest = std::mem::take(&mut d.get_mut().buf);
+                self.consume(&rest);
+            }
+        }
+        if self.broken {
+            return None;
+        }
+        match self.format {
+            // 最后一行可能没有换行
+            Format::Sse if !self.skipping_line && !self.buf.is_empty() => {
+                let line = std::mem::take(&mut self.buf);
+                self.line(&line);
+            }
+            Format::Json => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&self.buf) {
+                    self.usage.merge_event(&v);
                 }
             }
-            match self.format {
-                // 最后一行可能没有换行
-                Format::Sse if !self.skipping_line && !self.buf.is_empty() => {
-                    let line = std::mem::take(&mut self.buf);
-                    self.line(&line);
-                }
-                Format::Json => {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&self.buf) {
-                        self.usage.merge_event(&v);
-                    }
-                }
-                _ => {}
-            }
+            _ => {}
         }
         (!self.usage.is_empty()).then_some(self.usage)
     }
@@ -271,29 +324,184 @@ fn parser_for(headers: &HeaderMap) -> Option<Parser> {
         return None;
     };
     let decoder = match header_str(headers, "content-encoding").map(str::to_ascii_lowercase) {
-        None => Decoder::Identity,
-        Some(e) if e.is_empty() || e == "identity" => Decoder::Identity,
-        Some(e) if e == "gzip" || e == "x-gzip" => {
-            Decoder::Gzip(Box::new(flate2::write::GzDecoder::new(Vec::new())))
-        }
+        None => Decoder::Identity { seen: 0 },
+        Some(e) if e.is_empty() || e == "identity" => Decoder::Identity { seen: 0 },
+        Some(e) if e == "gzip" || e == "x-gzip" => gzip_decoder(),
         Some(_) => return None,
     };
     Some(Parser::new(decoder, format))
 }
 
+// ── 旁路线程 ─────────────────────────────────────────────────────────────
+
+enum Msg {
+    Start {
+        id: u64,
+        parser: Box<Parser>,
+        obs: Box<Observation>,
+    },
+    Chunk {
+        id: u64,
+        data: Bytes,
+    },
+    /// 字节额度不够、放弃这条的 token
+    Abort {
+        id: u64,
+    },
+    /// 回复流被释放（正常结束、客户端断开、上游出错都一样）
+    End {
+        id: u64,
+    },
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// 已 Start 未收尾的回复数
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// 已投递未解析的字节
+static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static WORKER: OnceLock<Option<mpsc::Sender<Msg>>> = OnceLock::new();
+
+/// 懒启动唯一的旁路系统线程；起不来就整个功能关闭（只记额度）
+fn worker() -> Option<&'static mpsc::Sender<Msg>> {
+    WORKER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<Msg>();
+            match std::thread::Builder::new()
+                .name("token-usage".into())
+                .spawn(move || run_worker(rx))
+            {
+                Ok(_) => {
+                    info!("token 用量旁路线程已启动");
+                    Some(tx)
+                }
+                Err(e) => {
+                    warn!(error = %e, "token 用量旁路线程启动失败，本次运行只记额度不记 token");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn run_worker(rx: mpsc::Receiver<Msg>) {
+    let mut streams: HashMap<u64, (Box<Parser>, Box<Observation>)> = HashMap::new();
+    for msg in rx {
+        match msg {
+            Msg::Start { id, parser, obs } => {
+                streams.insert(id, (parser, obs));
+            }
+            Msg::Chunk { id, data } => {
+                let len = data.len();
+                let broken = match streams.get_mut(&id) {
+                    Some((p, _)) => {
+                        p.feed(&data);
+                        p.broken
+                    }
+                    None => false,
+                };
+                drop(data);
+                INFLIGHT.fetch_sub(len, Ordering::Relaxed);
+                if broken {
+                    debug!("token 旁路解析出错或超限，这条只记额度");
+                    finish_stream(&mut streams, id, true);
+                }
+            }
+            Msg::Abort { id } => finish_stream(&mut streams, id, true),
+            Msg::End { id } => finish_stream(&mut streams, id, false),
+        }
+    }
+}
+
+fn finish_stream(
+    streams: &mut HashMap<u64, (Box<Parser>, Box<Observation>)>,
+    id: u64,
+    give_up: bool,
+) {
+    if let Some((parser, obs)) = streams.remove(&id) {
+        ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        let tokens = if give_up { None } else { parser.finish() };
+        super::quota_usage::complete(*obs, tokens);
+    }
+}
+
+/// 包在回复流外面：原样交回每一项，数据帧顺手投给旁路线程
+struct Tap {
+    inner: BodyStream,
+    id: u64,
+    /// None = 已放弃统计（额度不够或旁路线程不在），之后不再投递
+    tx: Option<mpsc::Sender<Msg>>,
+}
+
+impl Tap {
+    fn offer(&mut self, data: &Bytes) {
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        let len = data.len();
+        let before = INFLIGHT.fetch_add(len, Ordering::Relaxed);
+        if before.saturating_add(len) > MAX_INFLIGHT {
+            INFLIGHT.fetch_sub(len, Ordering::Relaxed);
+            debug!("token 旁路在途字节超限，放弃这条回复的 token 统计");
+            let _ = tx.send(Msg::Abort { id: self.id });
+            self.tx = None;
+            return;
+        }
+        if tx
+            .send(Msg::Chunk {
+                id: self.id,
+                data: data.clone(),
+            })
+            .is_err()
+        {
+            INFLIGHT.fetch_sub(len, Ordering::Relaxed);
+            self.tx = None;
+        }
+    }
+}
+
+impl Stream for Tap {
+    type Item = Result<Frame<Bytes>, reqwest::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let poll = this.inner.as_mut().poll_next(cx);
+        if let Poll::Ready(Some(Ok(frame))) = &poll {
+            if let Some(data) = frame.data_ref() {
+                this.offer(data);
+            }
+        }
+        poll
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for Tap {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Msg::End { id: self.id });
+        }
+    }
+}
+
 /// 转发出口调用：把回复流原样交回，同时（仅当这条回复有待补 token 的额度记录时）旁路读用量。
-/// 没有待补记录、格式不认识时直接返回原流，零开销。
-pub(super) fn wrap(stream: BodyStream, host: &str, path: &str, headers: &HeaderMap) -> BodyStream {
+/// 没有待补记录时直接返回原流，零开销；任何资源不够都退化成只记额度。
+pub(super) fn wrap(
+    stream: BodyStream,
+    host: &str,
+    path: &str,
+    headers: &HeaderMap,
+    request_id: uuid::Uuid,
+) -> BodyStream {
     if !super::cooldown::applies(host, path) {
         return stream;
     }
-    let Some(request_id) = header_str(headers, "request-id") else {
-        return stream;
-    };
     let Some(held) = super::quota_usage::take_held(request_id) else {
         return stream;
     };
-    let Some(mut parser) = parser_for(headers) else {
+    let Some(parser) = parser_for(headers) else {
         debug!(
             content_type = ?header_str(headers, "content-type"),
             content_encoding = ?header_str(headers, "content-encoding"),
@@ -302,30 +510,34 @@ pub(super) fn wrap(stream: BodyStream, host: &str, path: &str, headers: &HeaderM
         super::quota_usage::complete(held, None);
         return stream;
     };
-    let (tx, mut rx) = mpsc::channel::<Bytes>(CHANNEL_CAP);
-    tokio::spawn(async move {
-        while let Some(chunk) = rx.recv().await {
-            parser.feed(&chunk);
+    if ACTIVE.fetch_add(1, Ordering::Relaxed) >= MAX_ACTIVE {
+        ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        debug!("同时统计 token 的回复数已满，这条只记额度");
+        super::quota_usage::complete(held, None);
+        return stream;
+    }
+    let Some(tx) = worker() else {
+        ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        super::quota_usage::complete(held, None);
+        return stream;
+    };
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if let Err(mpsc::SendError(msg)) = tx.send(Msg::Start {
+        id,
+        parser: Box::new(parser),
+        obs: Box::new(held),
+    }) {
+        ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        if let Msg::Start { obs, .. } = msg {
+            super::quota_usage::complete(*obs, None);
         }
-        // 发送端随回复流一起释放（正常结束、客户端断开、上游出错都一样）→ 收尾写记录
-        super::quota_usage::complete(held, parser.finish());
-    });
-    let mut tx = Some(tx);
-    Box::pin(stream.inspect(move |item| {
-        let Ok(frame) = item else {
-            return;
-        };
-        let Some(data) = frame.data_ref() else {
-            return;
-        };
-        if let Some(sender) = &tx {
-            if sender.try_send(data.clone()).is_err() {
-                // 旁路跟不上或已退出：不再投递，这条 token 数会不完整，转发不受影响
-                debug!("token 旁路队列已满，放弃这条回复的 token 统计");
-                tx = None;
-            }
-        }
-    }))
+        return stream;
+    }
+    Box::pin(Tap {
+        inner: stream,
+        id,
+        tx: Some(tx.clone()),
+    })
 }
 
 #[cfg(test)]
@@ -344,16 +556,16 @@ mod tests {
         out
     }
 
+    fn ident() -> Decoder {
+        Decoder::Identity { seen: 0 }
+    }
+
     fn run(decoder: Decoder, format: Format, data: &[u8], chunk: usize) -> Option<TokenUsage> {
         let mut p = Parser::new(decoder, format);
         for c in data.chunks(chunk) {
             p.feed(c);
         }
         p.finish()
-    }
-
-    fn gz() -> Decoder {
-        Decoder::Gzip(Box::new(flate2::write::GzDecoder::new(Vec::new())))
     }
 
     fn expected_stream() -> TokenUsage {
@@ -366,12 +578,18 @@ mod tests {
         }
     }
 
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
     #[test]
     fn real_gzip_stream_any_chunking() {
         // 真实 Anthropic gzip 流，按任意大小切段（含逐字节）结果都一样
         for chunk in [1, 2, 3, 7, 64, 500, 100_000] {
             assert_eq!(
-                run(gz(), Format::Sse, STREAM_GZ, chunk),
+                run(gzip_decoder(), Format::Sse, STREAM_GZ, chunk),
                 Some(expected_stream()),
                 "chunk={chunk}"
             );
@@ -383,7 +601,7 @@ mod tests {
         let plain = gunzip(STREAM_GZ);
         for chunk in [1, 5, 300, 100_000] {
             assert_eq!(
-                run(Decoder::Identity, Format::Sse, &plain, chunk),
+                run(ident(), Format::Sse, &plain, chunk),
                 Some(expected_stream())
             );
         }
@@ -392,7 +610,7 @@ mod tests {
     #[test]
     fn real_gzip_json_message() {
         assert_eq!(
-            run(gz(), Format::Json, MESSAGE_GZ, 10),
+            run(gzip_decoder(), Format::Json, MESSAGE_GZ, 10),
             Some(TokenUsage {
                 model: Some("claude-haiku-4-5-20251001".into()),
                 input_tokens: Some(13),
@@ -407,18 +625,17 @@ mod tests {
     fn truncated_stream_keeps_what_was_seen() {
         // 客户端中途断开：只拿到 message_start，输入数仍然记下
         let plain = gunzip(STREAM_GZ);
-        let cut = plain.len() / 3;
         let u = run(
-            Decoder::Identity,
+            ident(),
             Format::Sse,
-            plain.get(..cut).unwrap(),
+            plain.get(..plain.len() / 3).unwrap(),
             50,
         )
         .unwrap();
         assert_eq!(u.input_tokens, Some(18));
         // gzip 截断同理，不报错
         let u = run(
-            gz(),
+            gzip_decoder(),
             Format::Sse,
             STREAM_GZ.get(..STREAM_GZ.len() / 2).unwrap(),
             9,
@@ -431,15 +648,15 @@ mod tests {
         let junk: Vec<u8> = (0..20_000u32)
             .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
             .collect();
-        assert_eq!(run(gz(), Format::Sse, &junk, 17), None);
-        assert_eq!(run(Decoder::Identity, Format::Sse, &junk, 17), None);
-        assert_eq!(run(Decoder::Identity, Format::Json, &junk, 17), None);
+        assert_eq!(run(gzip_decoder(), Format::Sse, &junk, 17), None);
+        assert_eq!(run(ident(), Format::Sse, &junk, 17), None);
+        assert_eq!(run(ident(), Format::Json, &junk, 17), None);
         // 坏 JSON 的用量行、类型不对的数字
         let bad = b"data: {\"usage\":\n data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":-3,\"input_tokens\":\"9\"}}\n";
-        assert_eq!(run(Decoder::Identity, Format::Sse, bad, 4), None);
+        assert_eq!(run(ident(), Format::Sse, bad, 4), None);
         // 超出 i64 的数字丢弃
         let huge = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":18446744073709551615,\"input_tokens\":5}}\n";
-        let u = run(Decoder::Identity, Format::Sse, huge, 8).unwrap();
+        let u = run(ident(), Format::Sse, huge, 8).unwrap();
         assert_eq!((u.input_tokens, u.output_tokens), (Some(5), None));
     }
 
@@ -451,27 +668,57 @@ mod tests {
         data.extend_from_slice(
             b"\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n",
         );
-        let u = run(Decoder::Identity, Format::Sse, &data, 4096).unwrap();
+        let u = run(ident(), Format::Sse, &data, 4096).unwrap();
         assert_eq!(u.output_tokens, Some(7));
         // 非流式超过上限：放弃
         let big = vec![b' '; MAX_JSON + 1];
-        assert_eq!(run(Decoder::Identity, Format::Json, &big, 65536), None);
+        assert_eq!(run(ident(), Format::Json, &big, 65536), None);
     }
 
     #[test]
-    fn decompression_bomb_capped() {
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-        let zeros = vec![b'\n'; 1024 * 1024];
-        for _ in 0..(MAX_DECODED / zeros.len() + 2) {
-            enc.write_all(&zeros).unwrap();
-        }
-        let bomb = enc.finish().unwrap();
-        let mut p = Parser::new(gz(), Format::Sse);
-        for c in bomb.chunks(4096) {
-            p.feed(c);
-        }
+    fn capped_sink_rejects_before_allocating() {
+        // 6号 P1-1：超限的写入在扩容前就被拒，缓冲不增长
+        let mut sink = CappedSink {
+            buf: Vec::new(),
+            total: 0,
+        };
+        assert!(sink.write(&vec![0u8; MAX_FEED_OUT + 1]).is_err());
+        assert_eq!((sink.buf.len(), sink.buf.capacity(), sink.total), (0, 0, 0));
+        assert!(sink.write(&[1, 2, 3]).is_ok());
+        sink.total = MAX_DECODED - 2;
+        sink.buf.clear();
+        assert!(sink.write(&[1, 2, 3]).is_err(), "总量上限同样写入前检查");
+    }
+
+    #[test]
+    fn decompression_bomb_released_on_first_chunk() {
+        // 单个 13 万字节的压缩块能解出 128MB：一段就超限、立刻释放，不会先攒满再检查
+        let bomb = gzip_bytes(&vec![b'\n'; 128 * 1024 * 1024]);
+        let mut p = Parser::new(gzip_decoder(), Format::Sse);
+        p.feed(&bomb);
         assert!(p.broken);
+        assert!(
+            matches!(p.decoder, Decoder::Identity { .. }),
+            "解压器已释放"
+        );
+        assert_eq!(p.buf.capacity(), 0);
         assert_eq!(p.finish(), None);
+    }
+
+    #[test]
+    fn trailing_garbage_after_gzip_releases_decoder() {
+        // 6号 P1-1：write_all 报错路径也要释放，不能带着解压器继续等
+        let mut data = STREAM_GZ.to_vec();
+        data.extend_from_slice(b"\x00garbage-not-gzip");
+        let mut p = Parser::new(gzip_decoder(), Format::Sse);
+        p.feed(&data);
+        if p.broken {
+            assert!(matches!(p.decoder, Decoder::Identity { .. }));
+            assert_eq!(p.buf.capacity(), 0);
+        }
+        // 不论 flate2 把尾巴当错误还是忽略，都不能 panic，结果要么完整要么 None
+        let r = p.finish();
+        assert!(r.is_none() || r == Some(expected_stream()));
     }
 
     #[test]
@@ -493,7 +740,7 @@ mod tests {
         .unwrap();
         assert!(matches!(p.decoder, Decoder::Gzip(_)) && p.format == Format::Sse);
         let p = parser_for(&h(&[("content-type", "application/json")])).unwrap();
-        assert!(matches!(p.decoder, Decoder::Identity) && p.format == Format::Json);
+        assert!(matches!(p.decoder, Decoder::Identity { .. }) && p.format == Format::Json);
         assert!(parser_for(&h(&[
             ("content-type", "text/event-stream"),
             ("content-encoding", "br")
@@ -507,8 +754,8 @@ mod tests {
 #[cfg(test)]
 mod wrap_tests {
     use super::*;
-    use futures_util::stream;
-    use hyper::body::Frame;
+    use futures_util::{stream, StreamExt};
+    use std::time::{Duration, Instant};
 
     const STREAM_GZ: &[u8] = include_bytes!("testdata/anthropic_stream.sse.gz");
 
@@ -520,9 +767,8 @@ mod wrap_tests {
         Box::pin(stream::iter(frames))
     }
 
-    fn headers(rid: &str, ct: &str, enc: Option<&str>) -> HeaderMap {
+    fn headers(ct: &str, enc: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert("request-id", rid.parse().unwrap());
         h.insert("content-type", ct.parse().unwrap());
         if let Some(e) = enc {
             h.insert("content-encoding", e.parse().unwrap());
@@ -530,22 +776,28 @@ mod wrap_tests {
         h
     }
 
-    /// 造一条暂存的观测（走真实 record 入口）
-    fn hold(rid: &str, secret: &str) {
+    /// 造一条暂存的观测（走真实 record 入口），返回网关请求编号
+    fn hold(secret: &str) -> uuid::Uuid {
+        let rid = uuid::Uuid::new_v4();
         let resp = reqwest::Response::from(
             hyper::Response::builder()
                 .status(200)
-                .header("request-id", rid)
                 .header("anthropic-ratelimit-unified-5h-utilization", "0.3")
                 .body(Vec::<u8>::new())
                 .unwrap(),
         );
-        super::super::quota_usage::record(Some(secret), "api.anthropic.com", "/v1/messages", &resp);
+        super::super::quota_usage::record(
+            Some(secret),
+            "api.anthropic.com",
+            "/v1/messages",
+            &resp,
+            Some(rid),
+        );
+        rid
     }
 
-    async fn collect(s: BodyStream) -> Vec<u8> {
+    async fn collect(mut s: BodyStream) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut s = s;
         while let Some(item) = s.next().await {
             if let Ok(f) = item {
                 if let Some(d) = f.data_ref() {
@@ -557,102 +809,81 @@ mod wrap_tests {
     }
 
     async fn completed(secret: &str) -> Vec<Option<TokenUsage>> {
-        // 旁路任务异步收尾，稍等一下
-        for _ in 0..100 {
+        // 旁路线程异步收尾，稍等一下
+        for _ in 0..300 {
             let got = super::super::quota_usage::drain_for_test(secret);
             if !got.is_empty() {
                 return got;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         Vec::new()
     }
 
+    fn wrap_msg(s: BodyStream, h: &HeaderMap, rid: uuid::Uuid) -> BodyStream {
+        wrap(s, "api.anthropic.com", "/v1/messages", h, rid)
+    }
+
     #[tokio::test]
     async fn bytes_pass_through_unchanged_and_tokens_recorded() {
-        hold("req_wrap_1", "wrap1");
-        let h = headers(
-            "req_wrap_1",
-            "text/event-stream; charset=utf-8",
-            Some("gzip"),
-        );
-        let out = collect(wrap(
-            upstream(STREAM_GZ, 37),
-            "api.anthropic.com",
-            "/v1/messages",
-            &h,
-        ))
-        .await;
+        let rid = hold("wrap1");
+        let h = headers("text/event-stream; charset=utf-8", Some("gzip"));
+        let out = collect(wrap_msg(upstream(STREAM_GZ, 37), &h, rid)).await;
         assert_eq!(out, STREAM_GZ, "转发出去的字节必须和上游一模一样");
         let rows = completed("wrap1").await;
         assert_eq!(rows.len(), 1);
-        let t = rows[0].clone().unwrap();
+        let t = rows.first().cloned().flatten().unwrap();
         assert_eq!((t.input_tokens, t.output_tokens), (Some(18), Some(177)));
     }
 
     #[tokio::test]
     async fn client_disconnect_mid_stream_still_records() {
-        hold("req_wrap_2", "wrap2");
-        let h = headers("req_wrap_2", "text/event-stream", Some("gzip"));
-        let mut s = wrap(
-            upstream(STREAM_GZ, 64),
-            "api.anthropic.com",
-            "/v1/messages",
-            &h,
-        );
-        // 只读前几段就丢掉（客户端断开）
+        let rid = hold("wrap2");
+        let h = headers("text/event-stream", Some("gzip"));
+        let mut s = wrap_msg(upstream(STREAM_GZ, 64), &h, rid);
         for _ in 0..5 {
             s.next().await;
         }
         drop(s);
-        let rows = completed("wrap2").await;
-        assert_eq!(rows.len(), 1, "断开也要写一行（额度列不丢）");
+        assert_eq!(
+            completed("wrap2").await.len(),
+            1,
+            "断开也要写一行（额度列不丢）"
+        );
     }
 
     #[tokio::test]
     async fn unknown_encoding_records_quota_only_and_passes_through() {
-        hold("req_wrap_3", "wrap3");
-        let h = headers("req_wrap_3", "text/event-stream", Some("br"));
-        let out = collect(wrap(
-            upstream(b"whatever", 3),
-            "api.anthropic.com",
-            "/v1/messages",
-            &h,
-        ))
-        .await;
+        let rid = hold("wrap3");
+        let h = headers("text/event-stream", Some("br"));
+        let out = collect(wrap_msg(upstream(b"whatever", 3), &h, rid)).await;
         assert_eq!(out, b"whatever");
         assert_eq!(completed("wrap3").await, vec![None]);
     }
 
     #[tokio::test]
     async fn not_held_or_other_host_is_untouched() {
-        let h = headers("req_never_held", "text/event-stream", None);
-        let out = collect(wrap(
-            upstream(b"abc", 1),
-            "api.anthropic.com",
-            "/v1/messages",
-            &h,
-        ))
-        .await;
+        let h = headers("text/event-stream", None);
+        let out = collect(wrap_msg(upstream(b"abc", 1), &h, uuid::Uuid::new_v4())).await;
         assert_eq!(out, b"abc");
-        hold("req_wrap_4", "wrap4");
-        let h = headers("req_wrap_4", "text/event-stream", None);
+        let rid = hold("wrap4");
         let out = collect(wrap(
             upstream(b"abc", 1),
             "api.openai.com",
             "/v1/messages",
             &h,
+            rid,
         ))
         .await;
         assert_eq!(out, b"abc");
         // 别的 host 不认领，暂存还在
-        assert!(super::super::quota_usage::take_held("req_wrap_4").is_some());
+        assert!(super::super::quota_usage::take_held(rid).is_some());
     }
 
     #[tokio::test]
     async fn upstream_error_mid_stream_is_forwarded_and_recorded() {
-        hold("req_wrap_5", "wrap5");
-        let h = headers("req_wrap_5", "text/event-stream", Some("gzip"));
+        let rid = hold("wrap5");
+        let h = headers("text/event-stream", Some("gzip"));
         let err = reqwest::Client::new()
             .get("http://127.0.0.1:1/")
             .send()
@@ -661,12 +892,7 @@ mod wrap_tests {
         let half = STREAM_GZ.get(..STREAM_GZ.len() / 2).unwrap();
         let frames: Vec<Result<Frame<Bytes>, reqwest::Error>> =
             vec![Ok(Frame::data(Bytes::copy_from_slice(half))), Err(err)];
-        let mut s = wrap(
-            Box::pin(stream::iter(frames)),
-            "api.anthropic.com",
-            "/v1/messages",
-            &h,
-        );
+        let mut s = wrap_msg(Box::pin(stream::iter(frames)), &h, rid);
         assert!(matches!(s.next().await, Some(Ok(_))));
         assert!(
             matches!(s.next().await, Some(Err(_))),
@@ -675,5 +901,72 @@ mod wrap_tests {
         assert!(s.next().await.is_none());
         drop(s);
         assert_eq!(completed("wrap5").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inflight_budget_exceeded_gives_up_but_forwards() {
+        // 一帧就超过全局在途字节上限：放弃这条的 token，字节照样全部转发
+        let rid = hold("wrap6");
+        let h = headers("text/event-stream", None);
+        let big = vec![b'x'; MAX_INFLIGHT + 1];
+        let out = collect(wrap_msg(upstream(&big, MAX_INFLIGHT + 1), &h, rid)).await;
+        assert_eq!(out.len(), big.len());
+        assert_eq!(completed("wrap6").await, vec![None]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heavy_parsing_does_not_stall_tokio_workers() {
+        // 6号 P1-2：两条各解压 60MB 的回复同时在跑，同一运行时里 10ms 的计时器不能被拖慢
+        let line =
+            b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"xxxxxxxxxxxxxxxx\"}}\n";
+        let mut plain = Vec::with_capacity(60 * 1024 * 1024);
+        while plain.len() < 60 * 1024 * 1024 {
+            plain.extend_from_slice(line);
+        }
+        plain.extend_from_slice(
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n",
+        );
+        let gz = Bytes::from(super::tests_support::gzip(&plain));
+        let h = headers("text/event-stream", Some("gzip"));
+        let mut tasks = Vec::new();
+        for name in ["heavy1", "heavy2"] {
+            let rid = hold(name);
+            let s = wrap_msg(upstream(&gz, 16 * 1024), &h, rid);
+            tasks.push(tokio::spawn(collect(s)));
+        }
+        let mut worst = Duration::ZERO;
+        for _ in 0..20 {
+            let t = Instant::now();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            worst = worst.max(t.elapsed());
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap().len(), gz.len());
+        }
+        assert!(
+            worst < Duration::from_millis(60),
+            "计时器最坏延迟 {worst:?}"
+        );
+        for name in ["heavy1", "heavy2"] {
+            let rows = completed(name).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows.first()
+                    .cloned()
+                    .flatten()
+                    .and_then(|t| t.output_tokens),
+                Some(42)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_support {
+    use std::io::Write;
+    pub(super) fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
     }
 }
