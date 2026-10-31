@@ -6,7 +6,8 @@
 //! - 全部有全局硬上限，超了就放弃这条的 token 统计（额度列照常写）：同时统计的回复数 `MAX_ACTIVE`、
 //!   通道消息数 `QUEUE_MSGS`、已投递未解析的字节 `MAX_INFLIGHT`（含每条消息开销）、每条解压总量 `MAX_DECODED`、
 //!   每段解压输出 `MAX_FEED_OUT`（写入前检查，不先分配再检查）、SSE 单行 `MAX_LINE`、非流式 JSON `MAX_JSON`。
-//!   最坏内存 ≈ MAX_INFLIGHT + QUEUE_MSGS × 消息大小 + MAX_ACTIVE ×（MAX_JSON + 解压器约 64KB）≈ 320MB，日常是 KB 级。
+//!   缓冲区容量也受上限约束（`append_capped`，不随 extend 倍增）。最坏内存量级：在途 32MB、
+//!   通道约 0.2MB、256 条 ×（JSON 1MB + 解压器约 64KB）、单段解压输出 4MB，合计约 310MB；另有 JSON 解析临时值与额度记录队列未计入，是有限上界而非精确保证；日常是 KB 级。
 //! - 解析失败、数据不完整、压缩格式不认识、旁路线程起不来：一律只是"这条没有 token 数"。
 //! - 网关 release 编译是 `panic = "abort"`，`catch_unwind` 兜不住，所以本模块按"不可能 panic"写：
 //!   不用 unwrap / expect / 下标切片，数值一律 saturating，缓冲区全部有上限。
@@ -116,6 +117,21 @@ impl TokenUsage {
     }
 }
 
+/// 追加数据，且容量也不超过上限（6号三审 P2：extend 会倍增容量，只限 len 不等于限住内存）。
+/// 调用方已保证 `buf.len() + data.len() <= cap`。
+fn append_capped(buf: &mut Vec<u8>, data: &[u8], cap: usize) {
+    let need = buf.len().saturating_add(data.len());
+    if buf.capacity() < need {
+        let target = buf
+            .capacity()
+            .saturating_mul(2)
+            .max(need)
+            .min(cap.max(need));
+        buf.reserve_exact(target.saturating_sub(buf.len()));
+    }
+    buf.extend_from_slice(data);
+}
+
 /// 解压输出的落点：写入**前**检查上限，超了直接报错、不扩容（6号 P1-1：不先分配再检查）
 struct CappedSink {
     buf: Vec<u8>,
@@ -128,7 +144,7 @@ impl Write for CappedSink {
         if total > MAX_DECODED || self.buf.len().saturating_add(data.len()) > MAX_FEED_OUT {
             return Err(io::Error::other("token 旁路解压超出上限"));
         }
-        self.buf.extend_from_slice(data);
+        append_capped(&mut self.buf, data, MAX_FEED_OUT);
         self.total = total;
         Ok(data.len())
     }
@@ -218,7 +234,7 @@ impl Parser {
                     self.fail();
                     return;
                 }
-                self.buf.extend_from_slice(plain);
+                append_capped(&mut self.buf, plain, MAX_JSON);
             }
         }
     }
@@ -239,7 +255,7 @@ impl Parser {
                         self.buf.clear();
                         continue;
                     }
-                    self.buf.extend_from_slice(head);
+                    append_capped(&mut self.buf, head, MAX_LINE);
                     let line = std::mem::take(&mut self.buf);
                     self.line(&line);
                 }
@@ -249,7 +265,7 @@ impl Parser {
                             self.buf = Vec::new();
                             self.skipping_line = true;
                         } else {
-                            self.buf.extend_from_slice(data);
+                            append_capped(&mut self.buf, data, MAX_LINE);
                         }
                     }
                     data = &[];
@@ -461,7 +477,7 @@ impl Worker {
                         t.parser.feed(&data);
                         if t.parser.broken {
                             debug!("token 旁路解析出错或超限，这条只记额度");
-                            t.ctl.stop.store(true, Ordering::Relaxed);
+                            t.ctl.stop.store(true, Ordering::Release);
                         }
                     }
                 }
@@ -474,12 +490,20 @@ impl Worker {
 
     /// 能收尾就收尾：放弃了 → 只记额度；流已释放且投递的段都处理完 → 带 token
     fn try_finish(&mut self, id: u64) {
+        // 先读 ended 再读 stop（6号三审 P2）：转发侧放弃时先置 stop 再 Drop 置 ended，
+        // 这样看到 ended 就一定看得到此前的 stop，不会把放弃的半截数据当完整 token 记下
         let ready = match self.streams.get(&id) {
-            Some(t) if t.ctl.stop.load(Ordering::Relaxed) => Some(true),
-            Some(t) if t.ctl.ended.load(Ordering::Acquire) => {
-                (t.processed >= t.ctl.sent.load(Ordering::Acquire)).then_some(false)
+            Some(t) => {
+                let ended = t.ctl.ended.load(Ordering::Acquire);
+                if t.ctl.stop.load(Ordering::Acquire) {
+                    Some(true)
+                } else if ended {
+                    (t.processed >= t.ctl.sent.load(Ordering::Acquire)).then_some(false)
+                } else {
+                    None
+                }
             }
-            _ => None,
+            None => None,
         };
         let Some(give_up) = ready else {
             return;
@@ -510,7 +534,7 @@ struct Tap {
 
 impl Tap {
     fn give_up(&mut self) {
-        self.ctl.stop.store(true, Ordering::Relaxed);
+        self.ctl.stop.store(true, Ordering::Release);
         self.tx = None;
     }
 
@@ -765,6 +789,26 @@ mod tests {
         // 非流式超过上限：放弃
         let big = vec![b' '; MAX_JSON + 1];
         assert_eq!(run(ident(), Format::Json, &big, 65536), None);
+    }
+
+    #[test]
+    fn buffer_capacity_never_exceeds_cap() {
+        // 6号三审 P2：先 MAX_JSON-1 再 1 字节，容量不能倍增到 2MB
+        let mut p = Parser::new(ident(), Format::Json);
+        p.feed(&vec![b' '; MAX_JSON - 1]);
+        p.feed(b" ");
+        assert_eq!(p.buf.len(), MAX_JSON);
+        assert!(
+            p.buf.capacity() <= MAX_JSON,
+            "capacity={}",
+            p.buf.capacity()
+        );
+        let mut v = Vec::new();
+        for _ in 0..655 {
+            append_capped(&mut v, &[1; 100], 64 * 1024);
+        }
+        assert_eq!(v.len(), 65_500);
+        assert!(v.capacity() <= 64 * 1024, "capacity={}", v.capacity());
     }
 
     #[test]
