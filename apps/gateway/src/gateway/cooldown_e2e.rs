@@ -262,9 +262,33 @@ async fn persisted_locks_and_http_forwarding() {
     };
     let week = quota_response("seven_day", reset + 200);
     let hour = quota_response("five_hour", reset + 500);
-    observe(&pool, Some("b"), "api.anthropic.com", "/v1/messages", &hour).await;
-    observe(&pool, Some("b"), "api.anthropic.com", "/v1/messages", &week).await;
-    observe(&pool, Some("b"), "api.anthropic.com", "/v1/messages", &hour).await;
+    observe(
+        &pool,
+        Some("b"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &hour,
+        None,
+    )
+    .await;
+    observe(
+        &pool,
+        Some("b"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &week,
+        None,
+    )
+    .await;
+    observe(
+        &pool,
+        Some("b"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &hour,
+        None,
+    )
+    .await;
     let older = quota_response("seven_day", reset + 100);
     observe(
         &pool,
@@ -272,6 +296,7 @@ async fn persisted_locks_and_http_forwarding() {
         "api.anthropic.com",
         "/v1/messages",
         &older,
+        None,
     )
     .await;
     let invalid = quota_response("seven_day", 1);
@@ -281,6 +306,7 @@ async fn persisted_locks_and_http_forwarding() {
         "api.anthropic.com",
         "/v1/messages",
         &invalid,
+        None,
     )
     .await;
     let row = sqlx::query_as::<_, (String, i64)>(
@@ -296,8 +322,22 @@ async fn persisted_locks_and_http_forwarding() {
         .await
         .unwrap();
     tokio::join!(
-        observe(&pool, Some("b"), "api.anthropic.com", "/v1/messages", &week),
-        observe(&pool, Some("b"), "api.anthropic.com", "/v1/messages", &hour)
+        observe(
+            &pool,
+            Some("b"),
+            "api.anthropic.com",
+            "/v1/messages",
+            &week,
+            None
+        ),
+        observe(
+            &pool,
+            Some("b"),
+            "api.anthropic.com",
+            "/v1/messages",
+            &hour,
+            None
+        )
     );
     let row = sqlx::query_as::<_, (String, i64)>(
         "SELECT reason,reset_at FROM secret_cooldowns WHERE secret_id='b'",

@@ -32,6 +32,7 @@ pub(crate) mod hooks;
 mod mitm;
 pub(crate) mod quota_usage;
 mod response;
+mod token_usage;
 mod transforms;
 mod tunnel;
 mod websocket;
