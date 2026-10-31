@@ -1359,6 +1359,8 @@ pub(crate) async fn forward_request(
     } else {
         Box::pin(upstream_resp.bytes_stream().map_ok(Frame::data))
     };
+    // 旁路读 token 用量（只读不改字节，异常只影响这条记录，见 token_usage.rs）
+    let body_stream = super::token_usage::wrap(body_stream, host, &path, &resp_headers);
 
     let body = http_body_util::StreamBody::new(body_stream);
     let mut response = Response::new(Either::Right(body));

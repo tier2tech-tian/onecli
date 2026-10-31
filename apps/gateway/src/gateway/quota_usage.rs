@@ -6,13 +6,19 @@
 //! 专用 1 个连接的独立连接池，每 5 秒把队列里攒下的观测用一条多行 INSERT 批量写入。
 //! 前台连接池完全不被占用，冷却读取、请求日志不受影响。
 //! 队列有上限：数据库长时间写不进时丢最旧的、告警，不会把网关内存撑爆。写失败的整批放回，下一轮重试。
+//!
+//! token 用量（10-31）：成功回复（2xx、带上游 `request-id`）的观测先按 request-id 暂存，
+//! 等 `token_usage` 旁路读完回复正文再连同 token 数一起入队，同一行写库；`observed_at` 仍是收到回复头的时刻。
+//! 暂存有上限，超过 30 分钟没人认领（比如回复没走到转发出口）的按无 token 入队，保证额度那几列不丢。
 use hyper::HeaderMap;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{LazyLock, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use super::token_usage::TokenUsage;
 use tracing::{info, warn};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -21,12 +27,19 @@ const DB_TIMEOUT: Duration = Duration::from_secs(10);
 const BATCH: usize = 1000;
 /// 内存里最多攒多少条（约 1.5 万条/天的量，够撑数据库断开好几天）
 const MAX_PENDING: usize = 100_000;
+/// 等 token 的暂存最多多少条（≈ 同时在流式输出的回复数），满了就不等 token 直接入队
+const MAX_HELD: usize = 10_000;
+/// 暂存最久多久；超时按无 token 入队
+const HOLD_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// 批量写入：数组展开成多行。账号已被删除的行跳过（不让整批因外键失败）。
 const INSERT: &str = "INSERT INTO secret_quota_usage (secret_id, observed_at, five_hour_utilization, five_hour_reset, \
-     seven_day_utilization, seven_day_reset, unified_status, http_status) \
-     SELECT u.* FROM UNNEST($1::text[], $2::bigint[], $3::float8[], $4::bigint[], $5::float8[], $6::bigint[], $7::text[], $8::int4[]) \
-       AS u(secret_id, observed_at, five_hour_utilization, five_hour_reset, seven_day_utilization, seven_day_reset, unified_status, http_status) \
+     seven_day_utilization, seven_day_reset, unified_status, http_status, \
+     model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens) \
+     SELECT u.* FROM UNNEST($1::text[], $2::bigint[], $3::float8[], $4::bigint[], $5::float8[], $6::bigint[], $7::text[], $8::int4[], \
+       $9::text[], $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[]) \
+       AS u(secret_id, observed_at, five_hour_utilization, five_hour_reset, seven_day_utilization, seven_day_reset, unified_status, http_status, \
+       model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens) \
      WHERE EXISTS (SELECT 1 FROM secrets s WHERE s.id = u.secret_id)";
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -76,17 +89,22 @@ pub(super) fn parse(headers: &HeaderMap) -> Option<QuotaUsage> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Observation {
+pub(super) struct Observation {
     secret_id: String,
     usage: QuotaUsage,
     http_status: i32,
     /// 观测时刻（毫秒）
     observed_at: i64,
+    /// 回复正文里的 token 用量；没读到就是 None
+    tokens: Option<TokenUsage>,
 }
 
 static PENDING: LazyLock<Mutex<VecDeque<Observation>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
 static STARTED: OnceLock<()> = OnceLock::new();
+/// 等 token 的观测：上游 request-id → (暂存时刻, 观测)
+static HELD: LazyLock<Mutex<HashMap<String, (Instant, Observation)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 入队；超过上限丢最旧的。返回丢掉的条数。
 fn push(obs: Observation) -> usize {
@@ -100,7 +118,73 @@ fn push(obs: Observation) -> usize {
     dropped
 }
 
-/// 热路径：只读响应头、入内存队列，不碰数据库
+fn push_logged(obs: Observation) {
+    let dropped = push(obs);
+    if dropped > 0 {
+        warn!(
+            dropped,
+            reason = "quota_usage_queue_full",
+            "额度用量队列已满，丢弃最旧记录"
+        );
+    }
+}
+
+/// 暂存等 token；暂存满了或 request-id 重复就交回调用方直接入队
+fn hold(request_id: &str, obs: Observation) -> Option<Observation> {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() >= MAX_HELD || held.contains_key(request_id) {
+        return Some(obs);
+    }
+    held.insert(request_id.to_owned(), (Instant::now(), obs));
+    None
+}
+
+/// 转发出口认领暂存的观测（token 旁路用）
+pub(super) fn take_held(request_id: &str) -> Option<Observation> {
+    HELD.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(request_id)
+        .map(|(_, obs)| obs)
+}
+
+/// 旁路读完回复：填上 token 数（可能没有）入队
+pub(super) fn complete(mut obs: Observation, tokens: Option<TokenUsage>) {
+    obs.tokens = tokens;
+    push_logged(obs);
+}
+
+/// 测试用：取出队列里某个账号的观测（只看 token 部分）
+#[cfg(test)]
+pub(super) fn drain_for_test(secret_id: &str) -> Vec<Option<TokenUsage>> {
+    let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let (mine, rest): (VecDeque<_>, VecDeque<_>) =
+        q.drain(..).partition(|o| o.secret_id == secret_id);
+    *q = rest;
+    mine.into_iter().map(|o| o.tokens).collect()
+}
+
+/// 超时没人认领的暂存按无 token 入队，返回条数
+fn sweep_held(max_age: Duration) -> usize {
+    let expired: Vec<Observation> = {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<String> = held
+            .iter()
+            .filter(|(_, (at, _))| at.elapsed() >= max_age)
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.iter()
+            .filter_map(|k| held.remove(k))
+            .map(|(_, obs)| obs)
+            .collect()
+    };
+    let n = expired.len();
+    for obs in expired {
+        push_logged(obs);
+    }
+    n
+}
+
+/// 热路径：只读响应头、入内存队列（或暂存等 token），不碰数据库
 pub(super) fn record(id: Option<&str>, host: &str, path: &str, response: &reqwest::Response) {
     if !super::cooldown::applies(host, path) {
         return;
@@ -111,18 +195,25 @@ pub(super) fn record(id: Option<&str>, host: &str, path: &str, response: &reqwes
     let Some(usage) = parse(response.headers()) else {
         return;
     };
-    let dropped = push(Observation {
+    let obs = Observation {
         secret_id: id.to_owned(),
         usage,
         http_status: response.status().as_u16() as i32,
         observed_at: (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
-    });
-    if dropped > 0 {
-        warn!(
-            dropped,
-            reason = "quota_usage_queue_full",
-            "额度用量队列已满，丢弃最旧记录"
-        );
+        tokens: None,
+    };
+    // 只有成功回复会原样转发给调用方、正文里才有用量；429 等轮换掉的回复直接入队
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty());
+    let obs = match request_id {
+        Some(rid) if response.status().is_success() => hold(rid, obs),
+        _ => Some(obs),
+    };
+    if let Some(obs) = obs {
+        push_logged(obs);
     }
 }
 
@@ -140,6 +231,12 @@ async fn flush(pool: &PgPool) -> u64 {
         }
         let col = |f: fn(&Observation) -> Option<f64>| batch.iter().map(f).collect::<Vec<_>>();
         let coli = |f: fn(&Observation) -> Option<i64>| batch.iter().map(f).collect::<Vec<_>>();
+        let tok = |f: fn(&TokenUsage) -> Option<i64>| {
+            batch
+                .iter()
+                .map(|o| o.tokens.as_ref().and_then(f))
+                .collect::<Vec<_>>()
+        };
         let result = tokio::time::timeout(
             DB_TIMEOUT,
             sqlx::query(INSERT)
@@ -161,6 +258,16 @@ async fn flush(pool: &PgPool) -> u64 {
                         .collect::<Vec<_>>(),
                 )
                 .bind(batch.iter().map(|o| o.http_status).collect::<Vec<_>>())
+                .bind(
+                    batch
+                        .iter()
+                        .map(|o| o.tokens.as_ref().and_then(|t| t.model.clone()))
+                        .collect::<Vec<_>>(),
+                )
+                .bind(tok(|t| t.input_tokens))
+                .bind(tok(|t| t.output_tokens))
+                .bind(tok(|t| t.cache_creation_input_tokens))
+                .bind(tok(|t| t.cache_read_input_tokens))
                 .execute(pool),
         )
         .await;
@@ -201,12 +308,13 @@ pub(crate) fn start(database_url: &str) {
             return;
         }
     };
-    info!("额度用量记录已启动：每条请求都记，每 5 秒批量写库，专用 1 个数据库连接");
+    info!("额度用量记录已启动：每条请求都记（成功回复连同 token 数），每 5 秒批量写库，专用 1 个数据库连接");
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            sweep_held(HOLD_MAX);
             flush(&pool).await;
         }
     });
@@ -298,6 +406,12 @@ async fn every_response_recorded_in_batches() {
         .unwrap();
     sqlx::raw_sql(include_str!(
         "../../../../packages/db/prisma/migrations/20261031010000_secret_quota_usage/migration.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../packages/db/prisma/migrations/20261031120000_secret_quota_usage_tokens/migration.sql"
     ))
     .execute(&pool)
     .await
@@ -469,6 +583,121 @@ async fn every_response_recorded_in_batches() {
     .await
     .unwrap();
     assert_eq!(tail, vec![(Some(0.83),), (Some(0.82),), (Some(0.81),)]);
+    // token 用量：成功回复暂存 → 认领填 token → 与额度同一行写入；老行 token 列为空
+    let ok = reqwest::Response::from(
+        hyper::Response::builder()
+            .status(200)
+            .header("request-id", "req_e2e_tokens")
+            .header("anthropic-ratelimit-unified-5h-utilization", "0.11")
+            .body(Vec::<u8>::new())
+            .unwrap(),
+    );
+    super::cooldown::observe(&pool, Some("q1"), "api.anthropic.com", "/v1/messages", &ok).await;
+    assert_eq!(flush(&pool).await, 0, "等 token 期间不写");
+    complete(
+        take_held("req_e2e_tokens").unwrap(),
+        Some(TokenUsage {
+            model: Some("claude-haiku-4-5-20251001".into()),
+            input_tokens: Some(18),
+            output_tokens: Some(177),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(4096),
+        }),
+    );
+    assert_eq!(flush(&pool).await, 1);
+    type TokenRow = (
+        Option<f64>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let row: TokenRow = sqlx::query_as(
+        "SELECT five_hour_utilization, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens \
+         FROM secret_quota_usage ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            Some(0.11),
+            Some("claude-haiku-4-5-20251001".into()),
+            Some(18),
+            Some(177),
+            Some(0),
+            Some(4096)
+        )
+    );
+    let empty: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM secret_quota_usage WHERE input_tokens IS NULL AND model IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(empty.0, 7, "之前没带 token 的 7 行，token 列为空");
+}
+
+#[test]
+fn held_until_claimed_or_expired() {
+    let resp = |status: u16, rid: Option<&str>| {
+        let mut b = hyper::Response::builder()
+            .status(status)
+            .header("anthropic-ratelimit-unified-7d-utilization", "0.5");
+        if let Some(r) = rid {
+            b = b.header("request-id", r);
+        }
+        reqwest::Response::from(b.body(Vec::<u8>::new()).unwrap())
+    };
+    // 成功 + 有 request-id：暂存，不入队
+    record(
+        Some("hold1"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &resp(200, Some("rid_h1")),
+    );
+    assert!(drain_for_test("hold1").is_empty());
+    // 429（会被轮换掉）、没有 request-id：直接入队
+    record(
+        Some("hold1"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &resp(429, Some("rid_h2")),
+    );
+    record(
+        Some("hold1"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &resp(200, None),
+    );
+    assert_eq!(drain_for_test("hold1"), vec![None, None]);
+    // 认领后填 token 入队
+    let obs = take_held("rid_h1").unwrap();
+    assert!(take_held("rid_h1").is_none(), "只能认领一次");
+    let t = TokenUsage {
+        output_tokens: Some(9),
+        ..Default::default()
+    };
+    complete(obs, Some(t.clone()));
+    assert_eq!(drain_for_test("hold1"), vec![Some(t)]);
+    // 没人认领：超时按无 token 入队
+    record(
+        Some("hold2"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &resp(200, Some("rid_h3")),
+    );
+    sweep_held(HOLD_MAX);
+    assert!(drain_for_test("hold2").is_empty(), "没超时不动");
+    // 只把这一条的暂存时刻拨到超时前（不用 ZERO 全扫，免得扫走并行测试的暂存）
+    if let Some(entry) = HELD.lock().unwrap().get_mut("rid_h3") {
+        entry.0 = Instant::now().checked_sub(HOLD_MAX * 2).unwrap();
+    }
+    sweep_held(HOLD_MAX);
+    assert_eq!(drain_for_test("hold2"), vec![None]);
+    assert!(take_held("rid_h3").is_none());
 }
 
 #[test]
@@ -478,6 +707,7 @@ fn queue_is_bounded_and_drops_oldest() {
         usage: QuotaUsage::default(),
         http_status: 200,
         observed_at: i,
+        tokens: None,
     };
     let mut q: VecDeque<Observation> = VecDeque::new();
     std::mem::swap(&mut q, &mut PENDING.lock().unwrap());

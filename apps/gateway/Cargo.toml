@@ -64,6 +64,9 @@ uuid = { version = "1", features = ["v4"] }
 # Stream combinators
 futures-util = "0.3"
 
+# 旁路解压模型回复读 token 用量（纯 Rust 后端，不引 C 库）
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # LRU cache (429 rotation offset)
 lru = "0.12"
 
