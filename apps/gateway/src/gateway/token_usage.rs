@@ -1,12 +1,12 @@
 //! 旁路读取模型回复里的 token 用量，补进同一条额度用量记录（`quota_usage`）。
 //!
 //! 隔离原则（大杰 10-31：出异常不能影响主流程、不能把网关搞挂；6号评审两项 P1 后重做）：
-//! - 转发路径上只做两件事：`Bytes` 引用计数克隆 + 非阻塞 `send` 给一个**独立系统线程**（不是 Tokio 任务）。
+//! - 转发路径上只做两件事：把数据帧复制成独立小块 + 非阻塞 `try_send` 给一个**独立系统线程**（不是 Tokio 任务）。
 //!   不改、不拦、不等任何字节，也不在 Tokio 工作线程上做解压/解析，转发调度不受影响。
 //! - 全部有全局硬上限，超了就放弃这条的 token 统计（额度列照常写）：同时统计的回复数 `MAX_ACTIVE`、
-//!   所有回复已投递未解析的字节 `MAX_INFLIGHT`、每条解压总量 `MAX_DECODED`、每段解压输出 `MAX_FEED_OUT`
-//!   （写入前检查，不先分配再检查）、SSE 单行 `MAX_LINE`、非流式 JSON `MAX_JSON`。
-//!   最坏内存 ≈ MAX_INFLIGHT + MAX_ACTIVE ×（MAX_JSON 或 MAX_LINE + 解压器约 64KB）≈ 300MB，日常是 KB 级。
+//!   通道消息数 `QUEUE_MSGS`、已投递未解析的字节 `MAX_INFLIGHT`（含每条消息开销）、每条解压总量 `MAX_DECODED`、
+//!   每段解压输出 `MAX_FEED_OUT`（写入前检查，不先分配再检查）、SSE 单行 `MAX_LINE`、非流式 JSON `MAX_JSON`。
+//!   最坏内存 ≈ MAX_INFLIGHT + QUEUE_MSGS × 消息大小 + MAX_ACTIVE ×（MAX_JSON + 解压器约 64KB）≈ 320MB，日常是 KB 级。
 //! - 解析失败、数据不完整、压缩格式不认识、旁路线程起不来：一律只是"这条没有 token 数"。
 //! - 网关 release 编译是 `panic = "abort"`，`catch_unwind` 兜不住，所以本模块按"不可能 panic"写：
 //!   不用 unwrap / expect / 下标切片，数值一律 saturating，缓冲区全部有上限。
@@ -22,10 +22,11 @@ use std::{
     io::{self, Write},
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc, Arc, OnceLock,
     },
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
 
@@ -333,42 +334,65 @@ fn parser_for(headers: &HeaderMap) -> Option<Parser> {
 }
 
 // ── 旁路线程 ─────────────────────────────────────────────────────────────
+//
+// 内存硬上限（6号复审 P1）：通道有界（QUEUE_MSGS 条），每段数据复制成独立的小块（不持有上游大块底层内存），
+// 按"字节数 + 每条消息开销"计入 MAX_INFLIGHT；空帧不投递。投递一律 try_send，满了就放弃这条统计。
+// 收尾不靠消息（消息可能因队列满发不出去）：每条回复一个共享的 Ctl，转发侧在 Drop 时置 ended、
+// 放弃时置 stop；旁路线程处理完已投递的段后自己收尾，并定期巡检（6号复审 P2：失败后转发侧立即停止投递）。
+
+/// 通道里最多积压多少条消息
+const QUEUE_MSGS: usize = 4096;
+/// 每条消息按这么多额外字节计费（消息节点、Bytes 头等）
+const MSG_OVERHEAD: usize = 128;
+/// 旁路线程巡检间隔
+const SCAN_EVERY: Duration = Duration::from_millis(200);
+
+/// 一条回复在转发侧与旁路线程之间共享的状态
+#[derive(Default)]
+struct Ctl {
+    /// 放弃统计（解析失败、额度不够、队列满）；转发侧看到后不再投递
+    stop: AtomicBool,
+    /// 回复流已释放（正常结束、客户端断开、上游出错都一样）
+    ended: AtomicBool,
+    /// 成功投递的段数
+    sent: AtomicU64,
+}
 
 enum Msg {
     Start {
         id: u64,
         parser: Box<Parser>,
         obs: Box<Observation>,
+        ctl: Arc<Ctl>,
     },
     Chunk {
         id: u64,
         data: Bytes,
     },
-    /// 字节额度不够、放弃这条的 token
-    Abort {
-        id: u64,
-    },
-    /// 回复流被释放（正常结束、客户端断开、上游出错都一样）
-    End {
-        id: u64,
-    },
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-/// 已 Start 未收尾的回复数
+/// 旁路线程里还没收尾的回复数（Start 前占位，收尾时释放）
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-/// 已投递未解析的字节
+/// 已投递未解析的字节（含每条消息开销）
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-static WORKER: OnceLock<Option<mpsc::Sender<Msg>>> = OnceLock::new();
+static WORKER: OnceLock<Option<mpsc::SyncSender<Msg>>> = OnceLock::new();
+
+/// 归还在途字节；饱和减，记账万一不对称也不会回绕成"永远超限"
+fn release_inflight(cost: usize) {
+    let _ = INFLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(cost))
+    });
+}
 
 /// 懒启动唯一的旁路系统线程；起不来就整个功能关闭（只记额度）
-fn worker() -> Option<&'static mpsc::Sender<Msg>> {
+fn worker() -> Option<&'static mpsc::SyncSender<Msg>> {
     WORKER
         .get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<Msg>();
+            let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE_MSGS);
             match std::thread::Builder::new()
                 .name("token-usage".into())
-                .spawn(move || run_worker(rx))
+                .spawn(move || Worker::default().run(rx))
             {
                 Ok(_) => {
                     info!("token 用量旁路线程已启动");
@@ -383,78 +407,141 @@ fn worker() -> Option<&'static mpsc::Sender<Msg>> {
         .as_ref()
 }
 
-fn run_worker(rx: mpsc::Receiver<Msg>) {
-    let mut streams: HashMap<u64, (Box<Parser>, Box<Observation>)> = HashMap::new();
-    for msg in rx {
+struct Tracked {
+    parser: Box<Parser>,
+    obs: Box<Observation>,
+    ctl: Arc<Ctl>,
+    processed: u64,
+}
+
+#[derive(Default)]
+struct Worker {
+    streams: HashMap<u64, Tracked>,
+}
+
+impl Worker {
+    fn run(mut self, rx: mpsc::Receiver<Msg>) {
+        let mut last_scan = Instant::now();
+        loop {
+            match rx.recv_timeout(SCAN_EVERY) {
+                Ok(msg) => self.on_msg(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if last_scan.elapsed() >= SCAN_EVERY {
+                self.scan();
+                last_scan = Instant::now();
+            }
+        }
+    }
+
+    fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Start { id, parser, obs } => {
-                streams.insert(id, (parser, obs));
+            Msg::Start {
+                id,
+                parser,
+                obs,
+                ctl,
+            } => {
+                self.streams.insert(
+                    id,
+                    Tracked {
+                        parser,
+                        obs,
+                        ctl,
+                        processed: 0,
+                    },
+                );
             }
             Msg::Chunk { id, data } => {
-                let len = data.len();
-                let broken = match streams.get_mut(&id) {
-                    Some((p, _)) => {
-                        p.feed(&data);
-                        p.broken
+                let cost = data.len().saturating_add(MSG_OVERHEAD);
+                if let Some(t) = self.streams.get_mut(&id) {
+                    t.processed = t.processed.saturating_add(1);
+                    if !t.ctl.stop.load(Ordering::Relaxed) {
+                        t.parser.feed(&data);
+                        if t.parser.broken {
+                            debug!("token 旁路解析出错或超限，这条只记额度");
+                            t.ctl.stop.store(true, Ordering::Relaxed);
+                        }
                     }
-                    None => false,
-                };
-                drop(data);
-                INFLIGHT.fetch_sub(len, Ordering::Relaxed);
-                if broken {
-                    debug!("token 旁路解析出错或超限，这条只记额度");
-                    finish_stream(&mut streams, id, true);
                 }
+                drop(data);
+                release_inflight(cost);
+                self.try_finish(id);
             }
-            Msg::Abort { id } => finish_stream(&mut streams, id, true),
-            Msg::End { id } => finish_stream(&mut streams, id, false),
+        }
+    }
+
+    /// 能收尾就收尾：放弃了 → 只记额度；流已释放且投递的段都处理完 → 带 token
+    fn try_finish(&mut self, id: u64) {
+        let ready = match self.streams.get(&id) {
+            Some(t) if t.ctl.stop.load(Ordering::Relaxed) => Some(true),
+            Some(t) if t.ctl.ended.load(Ordering::Acquire) => {
+                (t.processed >= t.ctl.sent.load(Ordering::Acquire)).then_some(false)
+            }
+            _ => None,
+        };
+        let Some(give_up) = ready else {
+            return;
+        };
+        if let Some(t) = self.streams.remove(&id) {
+            ACTIVE.fetch_sub(1, Ordering::Relaxed);
+            let tokens = if give_up { None } else { t.parser.finish() };
+            super::quota_usage::complete(*t.obs, tokens);
+        }
+    }
+
+    fn scan(&mut self) {
+        let ids: Vec<u64> = self.streams.keys().copied().collect();
+        for id in ids {
+            self.try_finish(id);
         }
     }
 }
 
-fn finish_stream(
-    streams: &mut HashMap<u64, (Box<Parser>, Box<Observation>)>,
-    id: u64,
-    give_up: bool,
-) {
-    if let Some((parser, obs)) = streams.remove(&id) {
-        ACTIVE.fetch_sub(1, Ordering::Relaxed);
-        let tokens = if give_up { None } else { parser.finish() };
-        super::quota_usage::complete(*obs, tokens);
-    }
-}
-
-/// 包在回复流外面：原样交回每一项，数据帧顺手投给旁路线程
+/// 包在回复流外面：原样交回每一项，数据帧顺手复制一份投给旁路线程
 struct Tap {
     inner: BodyStream,
     id: u64,
-    /// None = 已放弃统计（额度不够或旁路线程不在），之后不再投递
-    tx: Option<mpsc::Sender<Msg>>,
+    ctl: Arc<Ctl>,
+    /// None = 已放弃统计，之后不再投递
+    tx: Option<mpsc::SyncSender<Msg>>,
 }
 
 impl Tap {
+    fn give_up(&mut self) {
+        self.ctl.stop.store(true, Ordering::Relaxed);
+        self.tx = None;
+    }
+
     fn offer(&mut self, data: &Bytes) {
-        let Some(tx) = &self.tx else {
+        if self.tx.is_none() || data.is_empty() {
             return;
-        };
-        let len = data.len();
-        let before = INFLIGHT.fetch_add(len, Ordering::Relaxed);
-        if before.saturating_add(len) > MAX_INFLIGHT {
-            INFLIGHT.fetch_sub(len, Ordering::Relaxed);
-            debug!("token 旁路在途字节超限，放弃这条回复的 token 统计");
-            let _ = tx.send(Msg::Abort { id: self.id });
+        }
+        if self.ctl.stop.load(Ordering::Relaxed) {
             self.tx = None;
             return;
         }
-        if tx
-            .send(Msg::Chunk {
-                id: self.id,
-                data: data.clone(),
-            })
-            .is_err()
-        {
-            INFLIGHT.fetch_sub(len, Ordering::Relaxed);
-            self.tx = None;
+        let cost = data.len().saturating_add(MSG_OVERHEAD);
+        let before = INFLIGHT.fetch_add(cost, Ordering::Relaxed);
+        if before.saturating_add(cost) > MAX_INFLIGHT {
+            release_inflight(cost);
+            debug!("token 旁路在途字节超限，放弃这条回复的 token 统计");
+            self.give_up();
+            return;
+        }
+        // 复制成独立小块：不让旁路持有上游可能大得多的底层缓冲
+        let msg = Msg::Chunk {
+            id: self.id,
+            data: Bytes::copy_from_slice(data),
+        };
+        let sent = self.tx.as_ref().map(|tx| tx.try_send(msg).is_ok());
+        if sent == Some(true) {
+            self.ctl.sent.fetch_add(1, Ordering::Release);
+        } else {
+            release_inflight(cost);
+            debug!("token 旁路队列已满，放弃这条回复的 token 统计");
+            self.give_up();
         }
     }
 }
@@ -480,9 +567,8 @@ impl Stream for Tap {
 
 impl Drop for Tap {
     fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(Msg::End { id: self.id });
-        }
+        // 不发消息（可能发不出去）：置标记，旁路线程处理完已投递的段后自己收尾
+        self.ctl.ended.store(true, Ordering::Release);
     }
 }
 
@@ -522,12 +608,17 @@ pub(super) fn wrap(
         return stream;
     };
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Err(mpsc::SendError(msg)) = tx.send(Msg::Start {
+    let ctl = Arc::new(Ctl::default());
+    if let Err(e) = tx.try_send(Msg::Start {
         id,
         parser: Box::new(parser),
         obs: Box::new(held),
+        ctl: ctl.clone(),
     }) {
         ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        let msg = match e {
+            mpsc::TrySendError::Full(m) | mpsc::TrySendError::Disconnected(m) => m,
+        };
         if let Msg::Start { obs, .. } = msg {
             super::quota_usage::complete(*obs, None);
         }
@@ -536,6 +627,7 @@ pub(super) fn wrap(
     Box::pin(Tap {
         inner: stream,
         id,
+        ctl,
         tx: Some(tx.clone()),
     })
 }
@@ -826,6 +918,7 @@ mod wrap_tests {
 
     #[tokio::test]
     async fn bytes_pass_through_unchanged_and_tokens_recorded() {
+        let _serial = super::tests_support::SERIAL.lock().await;
         let rid = hold("wrap1");
         let h = headers("text/event-stream; charset=utf-8", Some("gzip"));
         let out = collect(wrap_msg(upstream(STREAM_GZ, 37), &h, rid)).await;
@@ -838,6 +931,7 @@ mod wrap_tests {
 
     #[tokio::test]
     async fn client_disconnect_mid_stream_still_records() {
+        let _serial = super::tests_support::SERIAL.lock().await;
         let rid = hold("wrap2");
         let h = headers("text/event-stream", Some("gzip"));
         let mut s = wrap_msg(upstream(STREAM_GZ, 64), &h, rid);
@@ -854,6 +948,7 @@ mod wrap_tests {
 
     #[tokio::test]
     async fn unknown_encoding_records_quota_only_and_passes_through() {
+        let _serial = super::tests_support::SERIAL.lock().await;
         let rid = hold("wrap3");
         let h = headers("text/event-stream", Some("br"));
         let out = collect(wrap_msg(upstream(b"whatever", 3), &h, rid)).await;
@@ -863,6 +958,7 @@ mod wrap_tests {
 
     #[tokio::test]
     async fn not_held_or_other_host_is_untouched() {
+        let _serial = super::tests_support::SERIAL.lock().await;
         let h = headers("text/event-stream", None);
         let out = collect(wrap_msg(upstream(b"abc", 1), &h, uuid::Uuid::new_v4())).await;
         assert_eq!(out, b"abc");
@@ -882,6 +978,7 @@ mod wrap_tests {
 
     #[tokio::test]
     async fn upstream_error_mid_stream_is_forwarded_and_recorded() {
+        let _serial = super::tests_support::SERIAL.lock().await;
         let rid = hold("wrap5");
         let h = headers("text/event-stream", Some("gzip"));
         let err = reqwest::Client::new()
@@ -905,6 +1002,7 @@ mod wrap_tests {
 
     #[tokio::test]
     async fn inflight_budget_exceeded_gives_up_but_forwards() {
+        let _serial = super::tests_support::SERIAL.lock().await;
         // 一帧就超过全局在途字节上限：放弃这条的 token，字节照样全部转发
         let rid = hold("wrap6");
         let h = headers("text/event-stream", None);
@@ -916,6 +1014,7 @@ mod wrap_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heavy_parsing_does_not_stall_tokio_workers() {
+        let _serial = super::tests_support::SERIAL.lock().await;
         // 6号 P1-2：两条各解压 60MB 的回复同时在跑，同一运行时里 10ms 的计时器不能被拖慢
         let line =
             b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"xxxxxxxxxxxxxxxx\"}}\n";
@@ -964,9 +1063,179 @@ mod wrap_tests {
 #[cfg(test)]
 mod tests_support {
     use std::io::Write;
+    /// 旁路的在途字节/活跃数是全局的：动到它们的测试串行跑，免得互相挤占额度
+    pub(super) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     pub(super) fn gzip(data: &[u8]) -> Vec<u8> {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         enc.write_all(data).unwrap();
         enc.finish().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    use futures_util::{stream, StreamExt};
+
+    fn tap_over(frames: Vec<Bytes>, cap: usize) -> (Tap, mpsc::Receiver<Msg>) {
+        let (tx, rx) = mpsc::sync_channel::<Msg>(cap);
+        let items: Vec<Result<Frame<Bytes>, reqwest::Error>> =
+            frames.into_iter().map(|b| Ok(Frame::data(b))).collect();
+        let tap = Tap {
+            inner: Box::pin(stream::iter(items)),
+            id: 7,
+            ctl: Arc::new(Ctl::default()),
+            tx: Some(tx),
+        };
+        (tap, rx)
+    }
+
+    fn chunks(rx: &mpsc::Receiver<Msg>) -> Vec<Bytes> {
+        rx.try_iter()
+            .filter_map(|m| match m {
+                Msg::Chunk { data, .. } => {
+                    release_inflight(data.len() + MSG_OVERHEAD);
+                    Some(data)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn empty_frames_skipped_and_data_copied() {
+        let _serial = super::tests_support::SERIAL.lock().await;
+        // 6号复审 P1：空帧不投递；投递的是独立复制的小块，不持有上游大块底层内存
+        let big = Bytes::from(vec![b'a'; 1024 * 1024]);
+        let small = big.slice(10..13);
+        let (mut tap, rx) = tap_over(vec![Bytes::new(), small.clone(), Bytes::new()], 16);
+        let mut out = Vec::new();
+        while let Some(Ok(f)) = tap.next().await {
+            out.push(f.into_data().unwrap());
+        }
+        assert_eq!(out.len(), 3, "空帧照样转发给调用方");
+        let got = chunks(&rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], small);
+        assert_ne!(got[0].as_ptr(), small.as_ptr(), "旁路拿到的是复制品");
+        assert_eq!(tap.ctl.sent.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn full_queue_gives_up_and_stops_sending() {
+        let _serial = super::tests_support::SERIAL.lock().await;
+        // 队列满：放弃统计、置 stop，后面的帧照样转发但不再投递
+        let frames: Vec<Bytes> = (0..10).map(|i| Bytes::from(vec![i as u8; 4])).collect();
+        let (mut tap, rx) = tap_over(frames, 2);
+        let mut n = 0;
+        while let Some(Ok(_)) = tap.next().await {
+            n += 1;
+        }
+        assert_eq!(n, 10, "转发不受影响");
+        assert!(tap.ctl.stop.load(Ordering::Relaxed));
+        assert!(tap.tx.is_none());
+        assert_eq!(chunks(&rx).len(), 2, "只进了队列容量那么多");
+        assert_eq!(tap.ctl.sent.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn stop_set_by_worker_halts_tap() {
+        let _serial = super::tests_support::SERIAL.lock().await;
+        // 6号复审 P2：旁路判定失败后，存活的转发侧立即停止投递
+        let frames: Vec<Bytes> = (0..5).map(|_| Bytes::from_static(b"xyz")).collect();
+        let (mut tap, rx) = tap_over(frames, 16);
+        tap.next().await;
+        tap.ctl.stop.store(true, Ordering::Relaxed);
+        while tap.next().await.is_some() {}
+        assert_eq!(chunks(&rx).len(), 1);
+        assert!(tap.tx.is_none());
+    }
+
+    #[test]
+    fn worker_finishes_on_failure_and_on_end_after_all_chunks() {
+        let _serial = super::tests_support::SERIAL.blocking_lock();
+        let rid = uuid::Uuid::new_v4();
+        let resp = |secret: &str| {
+            super::super::quota_usage::record(
+                Some(secret),
+                "api.anthropic.com",
+                "/v1/messages",
+                &reqwest::Response::from(
+                    hyper::Response::builder()
+                        .status(200)
+                        .header("anthropic-ratelimit-unified-5h-utilization", "0.3")
+                        .body(Vec::<u8>::new())
+                        .unwrap(),
+                ),
+                Some(rid),
+            )
+        };
+        let mut w = Worker::default();
+        // 坏 gzip：第一段就失败 → 置 stop、立即收尾（只记额度），释放占位
+        resp("wk1");
+        let ctl = Arc::new(Ctl::default());
+        ACTIVE.fetch_add(1, Ordering::Relaxed);
+        w.on_msg(Msg::Start {
+            id: 1,
+            parser: Box::new(Parser::new(gzip_decoder(), Format::Sse)),
+            obs: Box::new(super::super::quota_usage::take_held(rid).unwrap()),
+            ctl: ctl.clone(),
+        });
+        let junk = Bytes::from_static(b"this is definitely not a gzip stream at all");
+        INFLIGHT.fetch_add(junk.len() + MSG_OVERHEAD, Ordering::Relaxed);
+        w.on_msg(Msg::Chunk { id: 1, data: junk });
+        assert!(ctl.stop.load(Ordering::Relaxed));
+        assert!(w.streams.is_empty());
+        assert_eq!(super::super::quota_usage::drain_for_test("wk1"), vec![None]);
+
+        // 正常：ended 但还有已投递未处理的段 → 等处理完才收尾
+        let rid2 = uuid::Uuid::new_v4();
+        super::super::quota_usage::record(
+            Some("wk2"),
+            "api.anthropic.com",
+            "/v1/messages",
+            &reqwest::Response::from(
+                hyper::Response::builder()
+                    .status(200)
+                    .header("anthropic-ratelimit-unified-5h-utilization", "0.3")
+                    .body(Vec::<u8>::new())
+                    .unwrap(),
+            ),
+            Some(rid2),
+        );
+        let ctl = Arc::new(Ctl::default());
+        ACTIVE.fetch_add(1, Ordering::Relaxed);
+        w.on_msg(Msg::Start {
+            id: 2,
+            parser: Box::new(Parser::new(Decoder::Identity { seen: 0 }, Format::Sse)),
+            obs: Box::new(super::super::quota_usage::take_held(rid2).unwrap()),
+            ctl: ctl.clone(),
+        });
+        let line = Bytes::from_static(
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n",
+        );
+        ctl.sent.store(2, Ordering::Release);
+        ctl.ended.store(true, Ordering::Release);
+        let start_len =
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n"
+                .len();
+        INFLIGHT.fetch_add(start_len + line.len() + 2 * MSG_OVERHEAD, Ordering::Relaxed);
+        w.on_msg(Msg::Chunk {
+            id: 2,
+            data: Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n"),
+        });
+        w.scan();
+        assert_eq!(w.streams.len(), 1, "还有 1 段没处理，不能收尾");
+        w.on_msg(Msg::Chunk { id: 2, data: line });
+        assert!(w.streams.is_empty());
+        let rows = super::super::quota_usage::drain_for_test("wk2");
+        let t = rows.first().cloned().flatten().unwrap();
+        assert_eq!((t.input_tokens, t.output_tokens), (Some(3), Some(5)));
+        // 收尾后再来的段（不存在的 id）只归还额度，不出错
+        INFLIGHT.fetch_add(3 + MSG_OVERHEAD, Ordering::Relaxed);
+        w.on_msg(Msg::Chunk {
+            id: 2,
+            data: Bytes::from_static(b"abc"),
+        });
     }
 }
