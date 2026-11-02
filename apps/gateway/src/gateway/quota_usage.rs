@@ -756,6 +756,30 @@ fn agent_id_follows_observation_through_hold() {
         drain_agents_for_test("ag2"),
         vec![Some("pool-b".to_string())]
     );
+    // 暂存超时没人认领：按无 token 入队，agent 也不丢（6号 PR#8 建议补的永久回归）
+    let rid3 = uuid::Uuid::new_v4();
+    record(
+        Some("ag3"),
+        "api.anthropic.com",
+        "/v1/messages",
+        &resp(200),
+        Some(rid3),
+        Some("pool-c"),
+    );
+    // 只把这一条拨成「已超时」，用正常阈值清理，不碰其他并行测试的暂存
+    {
+        let mut held = HELD.lock().unwrap();
+        let (_, obs) = held.remove(&rid3.as_u128()).unwrap();
+        let old = Instant::now()
+            .checked_sub(HOLD_MAX + Duration::from_secs(1))
+            .unwrap();
+        held.insert(rid3.as_u128(), (old, obs));
+    }
+    sweep_held(HOLD_MAX);
+    assert_eq!(
+        drain_agents_for_test("ag3"),
+        vec![Some("pool-c".to_string())]
+    );
 }
 
 #[test]
