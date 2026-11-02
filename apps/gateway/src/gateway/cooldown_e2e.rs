@@ -269,6 +269,7 @@ async fn persisted_locks_and_http_forwarding() {
         "/v1/messages",
         &hour,
         None,
+        None,
     )
     .await;
     observe(
@@ -278,6 +279,7 @@ async fn persisted_locks_and_http_forwarding() {
         "/v1/messages",
         &week,
         None,
+        None,
     )
     .await;
     observe(
@@ -286,6 +288,7 @@ async fn persisted_locks_and_http_forwarding() {
         "api.anthropic.com",
         "/v1/messages",
         &hour,
+        None,
         None,
     )
     .await;
@@ -297,6 +300,7 @@ async fn persisted_locks_and_http_forwarding() {
         "/v1/messages",
         &older,
         None,
+        None,
     )
     .await;
     let invalid = quota_response("seven_day", 1);
@@ -306,6 +310,7 @@ async fn persisted_locks_and_http_forwarding() {
         "api.anthropic.com",
         "/v1/messages",
         &invalid,
+        None,
         None,
     )
     .await;
@@ -328,7 +333,8 @@ async fn persisted_locks_and_http_forwarding() {
             "api.anthropic.com",
             "/v1/messages",
             &week,
-            None
+            None,
+            None,
         ),
         observe(
             &pool,
@@ -336,7 +342,8 @@ async fn persisted_locks_and_http_forwarding() {
             "api.anthropic.com",
             "/v1/messages",
             &hour,
-            None
+            None,
+            None,
         )
     );
     let row = sqlx::query_as::<_, (String, i64)>(
