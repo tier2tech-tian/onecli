@@ -1051,7 +1051,7 @@ mod wrap_tests {
     }
 
     fn wrap_msg(s: BodyStream, h: &HeaderMap, rid: uuid::Uuid) -> BodyStream {
-        wrap(s, "api.anthropic.com", "/v1/messages", h, rid)
+        wrap(s, "api.anthropic.com", "/v1/messages", h, rid, Instant::now())
     }
 
     #[tokio::test]
@@ -1065,6 +1065,9 @@ mod wrap_tests {
         assert_eq!(rows.len(), 1);
         let t = rows.first().cloned().flatten().unwrap();
         assert_eq!((t.input_tokens, t.output_tokens), (Some(18), Some(177)));
+        // 经过转发侧 Tap 打时间戳 → 旁路线程算出首字延迟（真实时钟，只验有值且不离谱）
+        let ttft = t.ttft_ms.expect("流式回复要记首字延迟");
+        assert!((0..5_000).contains(&ttft), "ttft={ttft}");
     }
 
     #[tokio::test]
@@ -1107,6 +1110,7 @@ mod wrap_tests {
             "/v1/messages",
             &h,
             rid,
+            Instant::now(),
         ))
         .await;
         assert_eq!(out, b"abc");
@@ -1322,7 +1326,7 @@ mod channel_tests {
         });
         let junk = Bytes::from_static(b"this is definitely not a gzip stream at all");
         INFLIGHT.fetch_add(junk.len() + MSG_OVERHEAD, Ordering::Relaxed);
-        w.on_msg(Msg::Chunk { id: 1, data: junk });
+        w.on_msg(Msg::Chunk { id: 1, data: junk, at: Instant::now() });
         assert!(ctl.stop.load(Ordering::Relaxed));
         assert!(w.streams.is_empty());
         assert_eq!(super::super::quota_usage::drain_for_test("wk1"), vec![None]);
@@ -1363,10 +1367,11 @@ mod channel_tests {
         w.on_msg(Msg::Chunk {
             id: 2,
             data: Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n"),
+            at: Instant::now(),
         });
         w.scan();
         assert_eq!(w.streams.len(), 1, "还有 1 段没处理，不能收尾");
-        w.on_msg(Msg::Chunk { id: 2, data: line });
+        w.on_msg(Msg::Chunk { id: 2, data: line, at: Instant::now() });
         assert!(w.streams.is_empty());
         let rows = super::super::quota_usage::drain_for_test("wk2");
         let t = rows.first().cloned().flatten().unwrap();
@@ -1376,6 +1381,7 @@ mod channel_tests {
         w.on_msg(Msg::Chunk {
             id: 2,
             data: Bytes::from_static(b"abc"),
+            at: Instant::now(),
         });
     }
 }
