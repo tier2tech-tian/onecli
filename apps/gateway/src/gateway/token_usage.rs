@@ -207,7 +207,8 @@ impl Parser {
         }
     }
 
-    /// 带上这段数据经过网关的时刻再解析（首字延迟按它算；gzip 时可能晚一段，误差在一个数据块内）
+    /// 带上这段数据经过网关的时刻再解析（首字延迟按它算）。gzip 每段写完都 flush，
+    /// 本段能解出的内容当场吐完，不会留到下一段被配上后来的时刻（6号 PR#9 P1）
     fn feed_at(&mut self, chunk: &[u8], at: Instant) {
         self.chunk_at = Some(at);
         self.feed(chunk);
@@ -220,10 +221,15 @@ impl Parser {
         }
         let is_delta = match line.strip_prefix(b"event:") {
             Some(name) => name.trim_ascii() == b"content_block_delta",
+            // 没有 event 行时读 data 的顶层 type（不依赖空白和键顺序，6号 P2）；先用子串粗筛，
+            // 只有含该词的行才解析，且找到首个后整条流不再进来
             None => line
                 .strip_prefix(b"data:")
-                .map(|p| p.trim_ascii_start().starts_with(b"{\"type\":\"content_block_delta\""))
-                .unwrap_or(false),
+                .filter(|p| contains(p, b"content_block_delta"))
+                .and_then(|p| serde_json::from_slice::<serde_json::Value>(p.trim_ascii()).ok())
+                .is_some_and(|v| {
+                    v.get("type").and_then(serde_json::Value::as_str) == Some("content_block_delta")
+                }),
         };
         if is_delta {
             self.first_content_at = self.chunk_at;
@@ -252,6 +258,12 @@ impl Parser {
             }
             Decoder::Gzip(d) => {
                 if d.write_all(chunk).is_err() {
+                    self.fail();
+                    return;
+                }
+                // flate2 写完可能把输出留在内部 32KB 缓冲里，下次 write 才吐；flush 把已能解出的全吐到 sink。
+                // 解压超限也会在这里报错 → 同样放弃（与 write_all 一致）
+                if d.flush().is_err() {
                     self.fail();
                     return;
                 }
@@ -802,6 +814,60 @@ mod tests {
             .position(|w| w == b"data: {\"type\":\"content_block_delta\"")
             .unwrap();
         assert_eq!(ttft_of(&data_only, pos), Some(350));
+    }
+
+    #[test]
+    fn ttft_gzip_segment_keeps_its_own_time() {
+        // 6号 PR#9 P1 回归：首段（含首个增量）100ms 到，第二段只有 ping、10s 后才到 → 必须记 100
+        let plain = gunzip(STREAM_GZ);
+        let pos = plain
+            .windows(b"event: content_block_delta".len())
+            .position(|w| w == b"event: content_block_delta")
+            .unwrap();
+        let first_delta_end = pos
+            + plain[pos..]
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .unwrap()
+            + 2;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&plain[..first_delta_end]).unwrap();
+        enc.flush().unwrap();
+        let seg1 = std::mem::take(enc.get_mut());
+        enc.write_all(b"event: ping\ndata: {\"type\": \"ping\"}\n\n").unwrap();
+        enc.write_all(&plain[first_delta_end..]).unwrap();
+        let seg2 = enc.finish().unwrap();
+        let start = Instant::now();
+        let mut p = Parser::new(gzip_decoder(), Format::Sse);
+        p.start = Some(start);
+        p.feed_at(&seg1, start + Duration::from_millis(100));
+        p.feed_at(&seg2, start + Duration::from_millis(10_000));
+        assert_eq!(p.finish().unwrap().ttft_ms, Some(100));
+    }
+
+    #[test]
+    fn ttft_data_only_reads_top_level_type() {
+        // 6号 PR#9 P2 回归：合法 JSON 的空格/键顺序不同也要认；非顶层的同名词不算
+        for line in [
+            "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"x\"}}",
+            "data: {\"index\":0,\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}",
+        ] {
+            let start = Instant::now();
+            let mut p = Parser::new(ident(), Format::Sse);
+            p.start = Some(start);
+            let head = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n";
+            p.feed_at(head.as_bytes(), start + Duration::from_millis(10));
+            p.feed_at(format!("{line}\n\n").as_bytes(), start + Duration::from_millis(200));
+            assert_eq!(p.finish().unwrap().ttft_ms, Some(200), "{line}");
+        }
+        let start = Instant::now();
+        let mut p = Parser::new(ident(), Format::Sse);
+        p.start = Some(start);
+        p.feed_at(
+            b"data: {\"type\":\"message_start\",\"note\":\"content_block_delta\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+            start + Duration::from_millis(10),
+        );
+        assert_eq!(p.finish().unwrap().ttft_ms, None, "只是值里出现这个词，不算首字");
     }
 
     #[test]
