@@ -602,6 +602,8 @@ model SecretQuotaUsage {
   outputTokens BigInt? @map("output_tokens")
   cacheCreationInputTokens BigInt? @map("cache_creation_input_tokens")
   cacheReadInputTokens BigInt? @map("cache_read_input_tokens")
+  /// 发起请求的 agent（= 账号池），老数据为空；不建外键，agent 删除后历史用量保留
+  agentId String? @map("agent_id")
   secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
   @@index([secretId, observedAt])
   @@index([observedAt])

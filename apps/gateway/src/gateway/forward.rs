@@ -850,6 +850,7 @@ pub(crate) async fn forward_request(
                     &path,
                     &resp,
                     Some(request_id),
+                    proxy_ctx.agent_id.as_deref(),
                 )
                 .await;
                 let resp = super::diagnostics::record_attempt(
@@ -979,6 +980,7 @@ pub(crate) async fn forward_request(
                         &path,
                         &resp,
                         Some(request_id),
+                        proxy_ctx.agent_id.as_deref(),
                     )
                     .await;
                     let resp = super::diagnostics::record_attempt(
@@ -1127,7 +1129,16 @@ pub(crate) async fn forward_request(
                     );
                 })
                 .with_context(|| format!("forwarding to {url}"))?;
-            super::cooldown::observe(pool, secret_id, host, &path, &resp, Some(request_id)).await;
+            super::cooldown::observe(
+                pool,
+                secret_id,
+                host,
+                &path,
+                &resp,
+                Some(request_id),
+                proxy_ctx.agent_id.as_deref(),
+            )
+            .await;
             let resp = super::diagnostics::record_attempt(
                 resp,
                 request_id,

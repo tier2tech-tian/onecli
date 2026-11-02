@@ -928,6 +928,7 @@ mod wrap_tests {
             "/v1/messages",
             &resp,
             Some(rid),
+            None,
         );
         rid
     }
@@ -1212,6 +1213,7 @@ mod channel_tests {
                         .unwrap(),
                 ),
                 Some(rid),
+                None,
             )
         };
         let mut w = Worker::default();
@@ -1246,6 +1248,7 @@ mod channel_tests {
                     .unwrap(),
             ),
             Some(rid2),
+            None,
         );
         let ctl = Arc::new(Ctl::default());
         ACTIVE.fetch_add(1, Ordering::Relaxed);
