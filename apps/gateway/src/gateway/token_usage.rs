@@ -55,6 +55,9 @@ pub(super) struct TokenUsage {
     pub output_tokens: Option<i64>,
     pub cache_creation_input_tokens: Option<i64>,
     pub cache_read_input_tokens: Option<i64>,
+    /// 首字延迟：网关收到请求 → 第一个内容增量（content_block_delta）经过网关，毫秒。
+    /// 只有流式回复有；不参与"有没有用量"的判断
+    pub ttft_ms: Option<i64>,
 }
 
 impl TokenUsage {
@@ -181,6 +184,12 @@ struct Parser {
     skipping_line: bool,
     broken: bool,
     usage: TokenUsage,
+    /// 网关收到这条请求的时刻（算首字延迟的起点）
+    start: Option<Instant>,
+    /// 正在解析的这段数据经过网关的时刻
+    chunk_at: Option<Instant>,
+    /// 第一个内容增量所在那段数据经过网关的时刻
+    first_content_at: Option<Instant>,
 }
 
 impl Parser {
@@ -192,6 +201,38 @@ impl Parser {
             skipping_line: false,
             broken: false,
             usage: TokenUsage::default(),
+            start: None,
+            chunk_at: None,
+            first_content_at: None,
+        }
+    }
+
+    /// 带上这段数据经过网关的时刻再解析（首字延迟按它算）。gzip 每段写完都 flush，
+    /// 本段能解出的内容当场吐完，不会留到下一段被配上后来的时刻（6号 PR#9 P1）
+    fn feed_at(&mut self, chunk: &[u8], at: Instant) {
+        self.chunk_at = Some(at);
+        self.feed(chunk);
+    }
+
+    /// 第一个内容增量：SSE 的 `event: content_block_delta` 行，或没有 event 行时 data 里的同名 type
+    fn note_content(&mut self, line: &[u8]) {
+        if self.first_content_at.is_some() {
+            return;
+        }
+        let is_delta = match line.strip_prefix(b"event:") {
+            Some(name) => name.trim_ascii() == b"content_block_delta",
+            // 没有 event 行时读 data 的顶层 type（不依赖空白和键顺序，6号 P2）；先用子串粗筛，
+            // 只有含该词的行才解析，且找到首个后整条流不再进来
+            None => line
+                .strip_prefix(b"data:")
+                .filter(|p| contains(p, b"content_block_delta"))
+                .and_then(|p| serde_json::from_slice::<serde_json::Value>(p.trim_ascii()).ok())
+                .is_some_and(|v| {
+                    v.get("type").and_then(serde_json::Value::as_str) == Some("content_block_delta")
+                }),
+        };
+        if is_delta {
+            self.first_content_at = self.chunk_at;
         }
     }
 
@@ -217,6 +258,12 @@ impl Parser {
             }
             Decoder::Gzip(d) => {
                 if d.write_all(chunk).is_err() {
+                    self.fail();
+                    return;
+                }
+                // flate2 写完可能把输出留在内部 32KB 缓冲里，下次 write 才吐；flush 把已能解出的全吐到 sink。
+                // 解压超限也会在这里报错 → 同样放弃（与 write_all 一致）
+                if d.flush().is_err() {
                     self.fail();
                     return;
                 }
@@ -275,6 +322,7 @@ impl Parser {
     }
 
     fn line(&mut self, line: &[u8]) {
+        self.note_content(line);
         let Some(payload) = line.strip_prefix(b"data:") else {
             return;
         };
@@ -314,6 +362,9 @@ impl Parser {
                 }
             }
             _ => {}
+        }
+        if let (Some(start), Some(first)) = (self.start, self.first_content_at) {
+            self.usage.ttft_ms = i64::try_from(first.saturating_duration_since(start).as_millis()).ok();
         }
         (!self.usage.is_empty()).then_some(self.usage)
     }
@@ -384,6 +435,8 @@ enum Msg {
     Chunk {
         id: u64,
         data: Bytes,
+        /// 这段数据经过网关的时刻
+        at: Instant,
     },
 }
 
@@ -469,12 +522,12 @@ impl Worker {
                     },
                 );
             }
-            Msg::Chunk { id, data } => {
+            Msg::Chunk { id, data, at } => {
                 let cost = data.len().saturating_add(MSG_OVERHEAD);
                 if let Some(t) = self.streams.get_mut(&id) {
                     t.processed = t.processed.saturating_add(1);
                     if !t.ctl.stop.load(Ordering::Relaxed) {
-                        t.parser.feed(&data);
+                        t.parser.feed_at(&data, at);
                         if t.parser.broken {
                             debug!("token 旁路解析出错或超限，这条只记额度");
                             t.ctl.stop.store(true, Ordering::Release);
@@ -558,6 +611,7 @@ impl Tap {
         let msg = Msg::Chunk {
             id: self.id,
             data: Bytes::copy_from_slice(data),
+            at: Instant::now(),
         };
         let sent = self.tx.as_ref().map(|tx| tx.try_send(msg).is_ok());
         if sent == Some(true) {
@@ -604,6 +658,7 @@ pub(super) fn wrap(
     path: &str,
     headers: &HeaderMap,
     request_id: uuid::Uuid,
+    start: Instant,
 ) -> BodyStream {
     if !super::cooldown::applies(host, path) {
         return stream;
@@ -611,7 +666,7 @@ pub(super) fn wrap(
     let Some(held) = super::quota_usage::take_held(request_id) else {
         return stream;
     };
-    let Some(parser) = parser_for(headers) else {
+    let Some(mut parser) = parser_for(headers) else {
         debug!(
             content_type = ?header_str(headers, "content-type"),
             content_encoding = ?header_str(headers, "content-encoding"),
@@ -631,6 +686,7 @@ pub(super) fn wrap(
         super::quota_usage::complete(held, None);
         return stream;
     };
+    parser.start = Some(start);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let ctl = Arc::new(Ctl::default());
     if let Err(e) = tx.try_send(Msg::Start {
@@ -691,6 +747,7 @@ mod tests {
             output_tokens: Some(177),
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
+            ttft_ms: None,
         }
     }
 
@@ -723,6 +780,107 @@ mod tests {
         }
     }
 
+    /// 分两段带时刻喂：第一段到第一个内容增量之前（+100ms），其余（+350ms）
+    fn ttft_of(plain: &[u8], split_at: usize) -> Option<i64> {
+        let start = Instant::now();
+        let mut p = Parser::new(ident(), Format::Sse);
+        p.start = Some(start);
+        let (a, b) = plain.split_at(split_at);
+        p.feed_at(a, start + Duration::from_millis(100));
+        p.feed_at(b, start + Duration::from_millis(350));
+        p.finish().and_then(|u| u.ttft_ms)
+    }
+
+    #[test]
+    fn ttft_is_time_of_chunk_with_first_content_delta() {
+        let plain = gunzip(STREAM_GZ);
+        let pos = plain
+            .windows(b"event: content_block_delta".len())
+            .position(|w| w == b"event: content_block_delta")
+            .unwrap();
+        // message_start / content_block_start / ping 都不算首字
+        assert_eq!(ttft_of(&plain, pos), Some(350));
+        // 首个增量在第一段里 → 第一段的时刻
+        assert_eq!(ttft_of(&plain, plain.len() - 1), Some(100));
+        // 没有 event 行、只有 data 行的流也认
+        let data_only: Vec<u8> = String::from_utf8(plain.clone())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("event:"))
+            .flat_map(|l| format!("{l}\n").into_bytes())
+            .collect();
+        let pos = data_only
+            .windows(b"data: {\"type\":\"content_block_delta\"".len())
+            .position(|w| w == b"data: {\"type\":\"content_block_delta\"")
+            .unwrap();
+        assert_eq!(ttft_of(&data_only, pos), Some(350));
+    }
+
+    #[test]
+    fn ttft_gzip_segment_keeps_its_own_time() {
+        // 6号 PR#9 P1 回归：首段（含首个增量）100ms 到，第二段只有 ping、10s 后才到 → 必须记 100
+        let plain = gunzip(STREAM_GZ);
+        let pos = plain
+            .windows(b"event: content_block_delta".len())
+            .position(|w| w == b"event: content_block_delta")
+            .unwrap();
+        let first_delta_end = pos
+            + plain[pos..]
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .unwrap()
+            + 2;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&plain[..first_delta_end]).unwrap();
+        enc.flush().unwrap();
+        let seg1 = std::mem::take(enc.get_mut());
+        enc.write_all(b"event: ping\ndata: {\"type\": \"ping\"}\n\n").unwrap();
+        enc.write_all(&plain[first_delta_end..]).unwrap();
+        let seg2 = enc.finish().unwrap();
+        let start = Instant::now();
+        let mut p = Parser::new(gzip_decoder(), Format::Sse);
+        p.start = Some(start);
+        p.feed_at(&seg1, start + Duration::from_millis(100));
+        p.feed_at(&seg2, start + Duration::from_millis(10_000));
+        assert_eq!(p.finish().unwrap().ttft_ms, Some(100));
+    }
+
+    #[test]
+    fn ttft_data_only_reads_top_level_type() {
+        // 6号 PR#9 P2 回归：合法 JSON 的空格/键顺序不同也要认；非顶层的同名词不算
+        for line in [
+            "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"x\"}}",
+            "data: {\"index\":0,\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}",
+        ] {
+            let start = Instant::now();
+            let mut p = Parser::new(ident(), Format::Sse);
+            p.start = Some(start);
+            let head = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n";
+            p.feed_at(head.as_bytes(), start + Duration::from_millis(10));
+            p.feed_at(format!("{line}\n\n").as_bytes(), start + Duration::from_millis(200));
+            assert_eq!(p.finish().unwrap().ttft_ms, Some(200), "{line}");
+        }
+        let start = Instant::now();
+        let mut p = Parser::new(ident(), Format::Sse);
+        p.start = Some(start);
+        p.feed_at(
+            b"data: {\"type\":\"message_start\",\"note\":\"content_block_delta\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+            start + Duration::from_millis(10),
+        );
+        assert_eq!(p.finish().unwrap().ttft_ms, None, "只是值里出现这个词，不算首字");
+    }
+
+    #[test]
+    fn ttft_with_gzip_and_without_start() {
+        let start = Instant::now();
+        let mut p = Parser::new(gzip_decoder(), Format::Sse);
+        p.start = Some(start);
+        p.feed_at(STREAM_GZ, start + Duration::from_millis(42));
+        assert_eq!(p.finish().unwrap().ttft_ms, Some(42));
+        // 没给起点（非转发路径）→ 不记，用量照常
+        assert_eq!(run(gzip_decoder(), Format::Sse, STREAM_GZ, 64), Some(expected_stream()));
+    }
+
     #[test]
     fn real_gzip_json_message() {
         assert_eq!(
@@ -733,6 +891,7 @@ mod tests {
                 output_tokens: Some(4),
                 cache_creation_input_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
+                ttft_ms: None,
             })
         );
     }
@@ -958,7 +1117,7 @@ mod wrap_tests {
     }
 
     fn wrap_msg(s: BodyStream, h: &HeaderMap, rid: uuid::Uuid) -> BodyStream {
-        wrap(s, "api.anthropic.com", "/v1/messages", h, rid)
+        wrap(s, "api.anthropic.com", "/v1/messages", h, rid, Instant::now())
     }
 
     #[tokio::test]
@@ -972,6 +1131,9 @@ mod wrap_tests {
         assert_eq!(rows.len(), 1);
         let t = rows.first().cloned().flatten().unwrap();
         assert_eq!((t.input_tokens, t.output_tokens), (Some(18), Some(177)));
+        // 经过转发侧 Tap 打时间戳 → 旁路线程算出首字延迟（真实时钟，只验有值且不离谱）
+        let ttft = t.ttft_ms.expect("流式回复要记首字延迟");
+        assert!((0..5_000).contains(&ttft), "ttft={ttft}");
     }
 
     #[tokio::test]
@@ -1014,6 +1176,7 @@ mod wrap_tests {
             "/v1/messages",
             &h,
             rid,
+            Instant::now(),
         ))
         .await;
         assert_eq!(out, b"abc");
@@ -1229,7 +1392,7 @@ mod channel_tests {
         });
         let junk = Bytes::from_static(b"this is definitely not a gzip stream at all");
         INFLIGHT.fetch_add(junk.len() + MSG_OVERHEAD, Ordering::Relaxed);
-        w.on_msg(Msg::Chunk { id: 1, data: junk });
+        w.on_msg(Msg::Chunk { id: 1, data: junk, at: Instant::now() });
         assert!(ctl.stop.load(Ordering::Relaxed));
         assert!(w.streams.is_empty());
         assert_eq!(super::super::quota_usage::drain_for_test("wk1"), vec![None]);
@@ -1270,10 +1433,11 @@ mod channel_tests {
         w.on_msg(Msg::Chunk {
             id: 2,
             data: Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n"),
+            at: Instant::now(),
         });
         w.scan();
         assert_eq!(w.streams.len(), 1, "还有 1 段没处理，不能收尾");
-        w.on_msg(Msg::Chunk { id: 2, data: line });
+        w.on_msg(Msg::Chunk { id: 2, data: line, at: Instant::now() });
         assert!(w.streams.is_empty());
         let rows = super::super::quota_usage::drain_for_test("wk2");
         let t = rows.first().cloned().flatten().unwrap();
@@ -1283,6 +1447,7 @@ mod channel_tests {
         w.on_msg(Msg::Chunk {
             id: 2,
             data: Bytes::from_static(b"abc"),
+            at: Instant::now(),
         });
     }
 }

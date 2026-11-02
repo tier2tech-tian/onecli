@@ -604,6 +604,8 @@ model SecretQuotaUsage {
   cacheReadInputTokens BigInt? @map("cache_read_input_tokens")
   /// 发起请求的 agent（= 账号池），老数据为空；不建外键，agent 删除后历史用量保留
   agentId String? @map("agent_id")
+  /// 首字延迟（毫秒）：网关收到请求 → 第一个内容增量经过网关；只有流式回复有
+  ttftMs BigInt? @map("ttft_ms")
   secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
   @@index([secretId, observedAt])
   @@index([observedAt])
