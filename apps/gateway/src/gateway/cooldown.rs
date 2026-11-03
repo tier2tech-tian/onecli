@@ -76,10 +76,11 @@ pub(super) async fn observe(
     response: &reqwest::Response,
     request_id: Option<uuid::Uuid>,
     agent_id: Option<&str>,
+    client_user: Option<&str>,
 ) {
     // 每次模型响应（含 200）顺手把账号实时用量记进内存，后台每 5 秒用专用连接写库；
     // 带网关请求编号的成功回复先暂存，等 token 旁路读完再一起入队（见 quota_usage / token_usage）
-    super::quota_usage::record(id, host, path, response, request_id, agent_id);
+    super::quota_usage::record(id, host, path, response, request_id, agent_id, client_user);
     if !applies(host, path) || response.status() != StatusCode::TOO_MANY_REQUESTS {
         return;
     }

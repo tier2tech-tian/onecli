@@ -74,6 +74,8 @@ pub(crate) struct ProxyContext {
     pub agent_name: Option<String>,
     pub agent_identifier: Option<String>,
     pub agent_token: Option<String>,
+    /// 代理用户名带的调用方用户 ID（CCVM 按人统计用量）；没带为 None
+    pub client_user: Option<String>,
 }
 
 /// Shared state for the gateway, passed to all request handlers.
@@ -599,6 +601,7 @@ async fn handle_connect(
 
     // Extract agent token from Proxy-Authorization header.
     let agent_token = inject::extract_agent_token(&req).filter(|t| !t.is_empty());
+    let client_user = inject::extract_proxy_user(&req);
 
     // Resolve at CONNECT time for the intercept decision and agent identity.
     // DB injection/policy rules are NOT frozen here — they're re-resolved
@@ -694,6 +697,7 @@ async fn handle_connect(
         agent_name,
         agent_identifier,
         agent_token: agent_token.clone(),
+        client_user,
     });
 
     tokio::spawn(
@@ -758,6 +762,7 @@ async fn handle_http_proxy(
     let hostname = strip_port(&authority).to_string();
 
     let agent_token = inject::extract_agent_token(&req).filter(|t| !t.is_empty());
+    let client_user = inject::extract_proxy_user(&req);
 
     let connection_id = connect::extract_connection_id(req.headers());
 
@@ -866,6 +871,7 @@ async fn handle_http_proxy(
         agent_name: resolved.agent_name,
         agent_identifier: resolved.agent_identifier,
         agent_token,
+        client_user,
     };
 
     let rules = mitm::ResolvedRules {

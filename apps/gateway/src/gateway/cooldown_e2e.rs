@@ -176,6 +176,7 @@ async fn persisted_locks_and_http_forwarding() {
             agent_name: None,
             agent_identifier: None,
             agent_token: None,
+            client_user: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
@@ -270,6 +271,7 @@ async fn persisted_locks_and_http_forwarding() {
         &hour,
         None,
         None,
+        None,
     )
     .await;
     observe(
@@ -280,6 +282,7 @@ async fn persisted_locks_and_http_forwarding() {
         &week,
         None,
         None,
+        None,
     )
     .await;
     observe(
@@ -288,6 +291,7 @@ async fn persisted_locks_and_http_forwarding() {
         "api.anthropic.com",
         "/v1/messages",
         &hour,
+        None,
         None,
         None,
     )
@@ -301,6 +305,7 @@ async fn persisted_locks_and_http_forwarding() {
         &older,
         None,
         None,
+        None,
     )
     .await;
     let invalid = quota_response("seven_day", 1);
@@ -310,6 +315,7 @@ async fn persisted_locks_and_http_forwarding() {
         "api.anthropic.com",
         "/v1/messages",
         &invalid,
+        None,
         None,
         None,
     )
@@ -335,6 +341,7 @@ async fn persisted_locks_and_http_forwarding() {
             &week,
             None,
             None,
+            None,
         ),
         observe(
             &pool,
@@ -342,6 +349,7 @@ async fn persisted_locks_and_http_forwarding() {
             "api.anthropic.com",
             "/v1/messages",
             &hour,
+            None,
             None,
             None,
         )
@@ -365,6 +373,7 @@ async fn persisted_locks_and_http_forwarding() {
         agent_name: None,
         agent_identifier: None,
         agent_token: None,
+        client_user: None,
     };
     let _ = blocked(
         reset,
@@ -550,6 +559,7 @@ async fn session_sticky_switches_on_429_and_repins() {
         agent_name: None,
         agent_identifier: None,
         agent_token: None,
+        client_user: None,
     });
     let px = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let px_addr = px.local_addr().unwrap();
@@ -722,6 +732,7 @@ async fn session_sticky_network_error_and_single_candidate() {
         agent_name: None,
         agent_identifier: None,
         agent_token: None,
+        client_user: None,
     });
     // 网关：forward_request 出错（上游断开）时回 502，不让测试服务崩
     let spawn_proxy = |rules: Arc<mitm::ResolvedRules>| {

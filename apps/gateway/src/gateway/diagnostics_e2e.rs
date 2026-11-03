@@ -120,6 +120,7 @@ async fn real_forwarding_persists_attempt_chain() {
             agent_name: Some("test".into()),
             agent_identifier: None,
             agent_token: None,
+            client_user: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
@@ -227,6 +228,7 @@ async fn real_forwarding_persists_attempt_chain() {
         agent_name: None,
         agent_identifier: None,
         agent_token: None,
+        client_user: None,
     };
     diagnostics::record_transport_error(
         &error,
