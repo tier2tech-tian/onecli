@@ -609,3 +609,169 @@ async fn session_sticky_switches_on_429_and_repins() {
     assert_eq!(take(), vec!["sb"]);
     println!("会话粘号 × 429 / 冷却：通过");
 }
+
+/// 会话粘号 × 网络错误 / 单候选（6号 PR#10 复审 P1/P2）：固定号连接被断 → 绑定清掉；单候选成功 → 记绑定
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "需要专用隔离库 COOLDOWN_TEST_DATABASE_URL"]
+async fn session_sticky_network_error_and_single_candidate() {
+    use super::super::*;
+    use super::*;
+    use crate::{
+        connect::SecretCandidate,
+        inject::{Injection, InjectionRule},
+    };
+    use http_body_util::{BodyExt, Full};
+    use hyper::{
+        body::{Bytes, Incoming},
+        service::service_fn,
+        Request, Response,
+    };
+    use hyper_util::rt::TokioIo;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+    let url = std::env::var("COOLDOWN_TEST_DATABASE_URL").expect("只允许隔离测试库");
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY);").execute(&pool).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../packages/db/prisma/migrations/20261027020000_secret_cooldowns/migration.sql"
+    ))
+    .execute(&pool)
+    .await
+    .ok();
+    for id in ["nd", "nb"] {
+        sqlx::query("INSERT INTO secrets(id) VALUES($1) ON CONFLICT DO NOTHING").bind(id).execute(&pool).await.unwrap();
+    }
+    // 上游：nd 收到请求后直接断连接（服务返回错误 → 连接关闭），nb 正常 200
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = up.local_addr().unwrap();
+    let seen_up = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = up.accept().await.unwrap();
+            let seen = seen_up.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let auth = req.headers().get("authorization").unwrap().to_str().unwrap().to_owned();
+                    seen.lock().unwrap().push(auth.clone());
+                    async move {
+                        req.into_body().collect().await.unwrap();
+                        if auth == "nd" {
+                            return Err::<Response<Full<Bytes>>, std::io::Error>(std::io::Error::other("断开"));
+                        }
+                        Ok(Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(Full::new(Bytes::from("ok")))
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), svc).await;
+            });
+        }
+    });
+    let client = reqwest::Client::builder().no_proxy().resolve("api.anthropic.com", up_addr).build().unwrap();
+    let host = format!("api.anthropic.com:{}", up_addr.port());
+    let cache = crate::cache::create_store().await.unwrap();
+    let approvals = crate::approval::create_store().await.unwrap();
+    let agent = uuid::Uuid::new_v4().to_string();
+    let rules_of = |ids: &[&str]| {
+        Arc::new(mitm::ResolvedRules {
+            injection_rules: vec![],
+            secret_candidates: ids
+                .iter()
+                .map(|id| SecretCandidate {
+                    secret_id: id.to_string(),
+                    rule: InjectionRule {
+                        path_pattern: "*".into(),
+                        injections: vec![Injection::SetHeader { name: "authorization".into(), value: id.to_string() }],
+                    },
+                })
+                .collect(),
+            policy_rules: vec![],
+            access_restricted: false,
+            intercept_token: None,
+            plan: "free".into(),
+            rewrite_host: None,
+            connection_label: None,
+            finalizer: None,
+            body_transform: None,
+            policy_mode: "allow".into(),
+            claim_token: None,
+            session_policy: None,
+            budget_bindings: vec![],
+        })
+    };
+    let ctx = Arc::new(ProxyContext {
+        project_id: None,
+        organization_id: None,
+        agent_id: Some(agent.clone()),
+        agent_name: None,
+        agent_identifier: None,
+        agent_token: None,
+    });
+    // 网关：forward_request 出错（上游断开）时回 502，不让测试服务崩
+    let spawn_proxy = |rules: Arc<mitm::ResolvedRules>| {
+        let (ctx, cache, approvals, pool, client, host) =
+            (ctx.clone(), cache.clone(), approvals.clone(), pool.clone(), client.clone(), host.clone());
+        async move {
+            let px = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = px.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let (socket, _) = px.accept().await.unwrap();
+                    let (rules, ctx, cache, approvals, pool, client, host) =
+                        (rules.clone(), ctx.clone(), cache.clone(), approvals.clone(), pool.clone(), client.clone(), host.clone());
+                    tokio::spawn(async move {
+                        let svc = service_fn(move |req| {
+                            let (rules, ctx, cache, approvals, pool, client, host) =
+                                (rules.clone(), ctx.clone(), cache.clone(), approvals.clone(), pool.clone(), client.clone(), host.clone());
+                            async move {
+                                match forward::forward_request(req, &host, "http", client, &rules, &*cache, &ctx, &approvals, &pool).await {
+                                    Ok(r) => Ok::<_, std::convert::Infallible>(r.map(http_body_util::Either::Left)),
+                                    Err(_) => Ok(Response::builder()
+                                        .status(502)
+                                        .body(http_body_util::Either::Right(Full::new(Bytes::from("upstream error"))))
+                                        .unwrap()),
+                                }
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), svc).await;
+                    });
+                }
+            });
+            addr
+        }
+    };
+    let send = |addr: std::net::SocketAddr, session: &'static str| async move {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-claude-code-session-id", session)
+            .body("x")
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    let take = || std::mem::take(&mut *seen.lock().unwrap());
+
+    // 1. 会话 V 固定在 nd，nd 连接被断 → 这次 502，绑定被清掉（下次不再先打 nd）
+    let multi = spawn_proxy(rules_of(&["nd", "nb"])).await;
+    forward::remember_sticky_for_test(&agent, "V", "nd");
+    assert_eq!(send(multi, "V").await, 502);
+    assert_eq!(take(), vec!["nd"]);
+    assert_eq!(forward::sticky_bound_for_test(&agent, "V"), None, "网络错误要清掉固定号");
+    // 2. 只有一个候选 nb：成功后也要记绑定
+    let single = spawn_proxy(rules_of(&["nb"])).await;
+    assert_eq!(send(single, "W").await, 200);
+    assert_eq!(take(), vec!["nb"]);
+    assert_eq!(forward::sticky_bound_for_test(&agent, "W").as_deref(), Some("nb"), "单候选成功要记绑定");
+    // 3. 池子扩容成 [nd, nb] 后，会话 W 仍从 nb 开始，不先打 nd
+    assert_eq!(send(multi, "W").await, 200);
+    assert_eq!(take(), vec!["nb"]);
+    println!("会话粘号 × 网络错误 / 单候选：通过");
+}

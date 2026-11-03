@@ -128,13 +128,20 @@ const STICKY_IDLE: std::time::Duration = std::time::Duration::from_secs(2 * 3600
 
 /// 会话粘号（大杰 11-03）：Claude Code 增量线程（previous_message_id）的状态存在上一轮服务的那个号上，
 /// 每请求换号会 404 再整段重发。同一会话（X-Claude-Code-Session-Id）优先用上次**成功**的号；
-/// 那个号 429 / 冷却时照旧轮换到下一个，成功后改记新号。(agent, 会话) → (账号, 最后成功时刻)
-static STICKY_SESSIONS: LazyLock<Mutex<LruCache<(String, String), (String, std::time::Instant)>>> =
-    LazyLock::new(|| {
-        Mutex::new(LruCache::new(
-            NonZeroUsize::new(STICKY_CACHE_CAP).unwrap(),
-        ))
-    });
+/// 那个号 429 / 冷却时照旧轮换到下一个，成功后改记新号；其他失败（含网络错误）忘掉，下次回到轮换。
+/// (agent, 会话) → 绑定；每次改动换一个新版本号，请求结束只在版本没被别的请求改过时才更新（6号 PR#10 P2）
+struct Binding {
+    secret: String,
+    at: std::time::Instant,
+    gen: u64,
+}
+
+static STICKY_SESSIONS: LazyLock<Mutex<LruCache<(String, String), Binding>>> = LazyLock::new(|| {
+    Mutex::new(LruCache::new(
+        NonZeroUsize::new(STICKY_CACHE_CAP).unwrap(),
+    ))
+});
+static STICKY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// 请求里的 Claude Code 会话编号；不是合理的短 ASCII 串就当没有
 fn session_key(headers: &hyper::HeaderMap) -> Option<String> {
@@ -142,51 +149,95 @@ fn session_key(headers: &hyper::HeaderMap) -> Option<String> {
     (!v.is_empty() && v.len() <= 128 && v.bytes().all(|b| b.is_ascii_graphic())).then(|| v.to_owned())
 }
 
-/// 这个会话上次成功用的号（没过期才算）
-fn sticky_secret(account_id: &str, session: &str) -> Option<String> {
-    let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let key = (account_id.to_owned(), session.to_owned());
-    match cache.get(&key) {
-        Some((secret, at)) if at.elapsed() < STICKY_IDLE => Some(secret.clone()),
-        Some(_) => {
-            cache.pop(&key);
-            None
+/// 一次请求开始时看到的会话绑定；结束时据此有条件地更新
+struct StickyCtx {
+    account: String,
+    session: Option<String>,
+    /// 开始时看到的绑定版本；None = 当时没有（或已过期）
+    observed: Option<u64>,
+    /// 开始时绑定的号
+    pinned: Option<String>,
+}
+
+impl StickyCtx {
+    fn observe(account_id: &str, session: Option<String>) -> Self {
+        let (pinned, observed) = match &session {
+            Some(s) => {
+                let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                let key = (account_id.to_owned(), s.clone());
+                match cache.get(&key) {
+                    Some(b) if b.at.elapsed() < STICKY_IDLE => (Some(b.secret.clone()), Some(b.gen)),
+                    Some(_) => {
+                        cache.pop(&key);
+                        (None, None)
+                    }
+                    None => (None, None),
+                }
+            }
+            None => (None, None),
+        };
+        Self {
+            account: account_id.to_owned(),
+            session,
+            observed,
+            pinned,
         }
-        None => None,
     }
-}
 
-/// 本次最终没成功（401/403/5xx 等非 429 也不会触发换号）→ 忘掉固定号，下次重新轮换，
-/// 免得会话粘死在一个坏号上（以前每请求轮换，坏号只影响一部分请求）
-fn forget_sticky(account_id: &str, session: Option<&str>) {
-    let Some(session) = session else { return };
-    let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    cache.pop(&(account_id.to_owned(), session.to_owned()));
-}
-
-/// 结束时按结果更新：2xx 记下这个号，其他一律忘掉
-fn settle_sticky(account_id: &str, session: Option<&str>, secret_id: &str, status: StatusCode) {
-    if status.is_success() {
-        remember_sticky(account_id, session, secret_id);
-    } else {
-        forget_sticky(account_id, session);
+    /// 结束时更新：成功记这个号，失败（含网络错误、全部冷却）忘掉。
+    /// 期间别的请求改过这条绑定（版本变了）就什么都不动：不覆盖别人新记的号，也不误删
+    fn settle(&self, secret_id: Option<&str>, success: bool) {
+        let Some(session) = &self.session else { return };
+        let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (self.account.clone(), session.clone());
+        if cache.peek(&key).map(|b| b.gen) != self.observed {
+            return;
+        }
+        match (success, secret_id) {
+            (true, Some(secret)) => {
+                cache.put(
+                    key,
+                    Binding {
+                        secret: secret.to_owned(),
+                        at: std::time::Instant::now(),
+                        gen: STICKY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    },
+                );
+            }
+            (true, None) => {}
+            (false, _) => {
+                cache.pop(&key);
+            }
+        }
     }
-}
-
-/// 记下会话这次成功用的号
-fn remember_sticky(account_id: &str, session: Option<&str>, secret_id: &str) {
-    let Some(session) = session else { return };
-    let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    cache.put(
-        (account_id.to_owned(), session.to_owned()),
-        (secret_id.to_owned(), std::time::Instant::now()),
-    );
 }
 
 /// 测试用：预置某会话已固定的号（端到端测试模拟"之前成功过"）
 #[cfg(test)]
 pub(super) fn remember_sticky_for_test(account_id: &str, session: &str, secret_id: &str) {
-    remember_sticky(account_id, Some(session), secret_id);
+    StickyCtx::observe(account_id, Some(session.to_owned())).settle_force(secret_id);
+}
+
+/// 测试用：某会话当前绑定的号
+#[cfg(test)]
+pub(super) fn sticky_bound_for_test(account_id: &str, session: &str) -> Option<String> {
+    let cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.peek(&(account_id.to_owned(), session.to_owned())).map(|b| b.secret.clone())
+}
+
+#[cfg(test)]
+impl StickyCtx {
+    fn settle_force(&self, secret_id: &str) {
+        let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        cache.put(
+            (self.account.clone(), self.session.clone().unwrap_or_default()),
+            Binding {
+                secret: secret_id.to_owned(),
+                at: std::time::Instant::now(),
+                gen: STICKY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            },
+        );
+    }
 }
 
 /// Injection source selection result for 429 rotation.
@@ -228,7 +279,7 @@ fn select_injection_source<'a>(
     request_path: &str,
     account_id: &str,
     host: &str,
-    session: Option<&str>,
+    sticky: &StickyCtx,
 ) -> InjectionSource<'a> {
     if candidates.is_empty() {
         return InjectionSource::Fallback;
@@ -246,10 +297,11 @@ fn select_injection_source<'a>(
         },
         _ => {
             // 有会话且上次成功的号还在候选里 → 从它开始；否则照旧轮换（不推进计数器，避免打乱别人）
-            let pinned = session
-                .and_then(|s| sticky_secret(account_id, s))
+            let pinned = sticky
+                .pinned
+                .as_deref()
                 .and_then(|secret| matching.iter().position(|c| c.secret_id == secret));
-            let (offset, sticky) = match (pinned, session) {
+            let (offset, state) = match (pinned, &sticky.session) {
                 (Some(i), _) => (i, "hit"),
                 (None, Some(_)) => (get_rotation_offset(account_id, host), "miss"),
                 (None, None) => (get_rotation_offset(account_id, host), "none"),
@@ -257,7 +309,7 @@ fn select_injection_source<'a>(
             InjectionSource::MultiSecret {
                 candidates: matching,
                 offset,
-                sticky,
+                sticky: state,
             }
         }
     }
@@ -499,14 +551,12 @@ pub(crate) async fn forward_request(
         ));
     }
     // 只对 Anthropic 模型请求按会话粘号；其他主机照旧每请求轮换
-    let session = if quota_scoped { session_key(&headers) } else { None };
-    let injection_source = select_injection_source(
-        &rules.secret_candidates,
-        &path,
+    let sticky_ctx = StickyCtx::observe(
         account_id,
-        host,
-        session.as_deref(),
+        if quota_scoped { session_key(&headers) } else { None },
     );
+    let injection_source =
+        select_injection_source(&rules.secret_candidates, &path, account_id, host, &sticky_ctx);
 
     let mut diagnostic_attempts = Vec::new();
     let (rotation_candidates, rotation_start, rotation_reason) = match &injection_source {
@@ -871,6 +921,7 @@ pub(crate) async fn forward_request(
                     .map(|i| candidates[(offset + i) % candidates.len()])
                     .find(|c| !current.contains_key(&c.secret_id));
                 let Some(candidate) = candidate else {
+                    sticky_ctx.settle(None, false);
                     return Ok(super::cooldown::blocked(
                         *current.values().min().unwrap(),
                         request_id,
@@ -922,6 +973,8 @@ pub(crate) async fn forward_request(
                     .send()
                     .await
                     .inspect_err(|error| {
+                        // 网络错误也算失败：忘掉固定号，免得下一轮还先打这个号（6号 PR#10 P1）
+                        sticky_ctx.settle(None, false);
                         super::diagnostics::record_transport_error(
                             error,
                             request_id,
@@ -960,7 +1013,7 @@ pub(crate) async fn forward_request(
                 )
                 .await;
                 let st = resp.status();
-                settle_sticky(account_id, session.as_deref(), &candidate.secret_id, st);
+                sticky_ctx.settle(Some(&candidate.secret_id), st.is_success());
                 info!(
                     %request_id, secret_id = %candidate.secret_id,
                     attempt = 1, total = candidates.len(), status = st.as_u16(), session_sticky = sticky,
@@ -1052,6 +1105,8 @@ pub(crate) async fn forward_request(
                         .send()
                         .await
                         .inspect_err(|error| {
+                            // 网络错误也算失败：忘掉固定号，免得下一轮还先打这个号（6号 PR#10 P1）
+                            sticky_ctx.settle(None, false);
                             super::diagnostics::record_transport_error(
                                 error,
                                 request_id,
@@ -1102,7 +1157,7 @@ pub(crate) async fn forward_request(
 
                     // If NOT 429, or this is the last candidate, return this response.
                     if st != StatusCode::TOO_MANY_REQUESTS || i == n - 1 {
-                        settle_sticky(account_id, session.as_deref(), &candidate.secret_id, st);
+                        sticky_ctx.settle(Some(&candidate.secret_id), st.is_success());
                         if st == StatusCode::TOO_MANY_REQUESTS && i > 0 {
                             warn!(
                                 %request_id,
@@ -1142,7 +1197,7 @@ pub(crate) async fn forward_request(
                 }
 
                 if last_resp.is_none() {
-                    forget_sticky(account_id, session.as_deref());
+                    sticky_ctx.settle(None, false);
                     return Ok(super::cooldown::blocked(
                         skipped_until.expect("所有候选均因冷却跳过"),
                         request_id,
@@ -1184,6 +1239,7 @@ pub(crate) async fn forward_request(
                 if let Some(id) = secret_id {
                     let current = super::cooldown::active(pool, &[id.to_owned()]).await;
                     if let Some(until) = current.get(id) {
+                        sticky_ctx.settle(None, false);
                         return Ok(super::cooldown::blocked(
                             *until,
                             request_id,
@@ -1211,6 +1267,8 @@ pub(crate) async fn forward_request(
                 .send()
                 .await
                 .inspect_err(|error| {
+                    // 网络错误也算失败：忘掉固定号，免得下一轮还先打这个号（6号 PR#10 P1）
+                    sticky_ctx.settle(None, false);
                     super::diagnostics::record_transport_error(
                         error,
                         request_id,
@@ -1249,6 +1307,10 @@ pub(crate) async fn forward_request(
             )
             .await;
             let st = resp.status();
+            // 单候选也记绑定：池子以后扩容时，这个会话仍从这个号开始（6号 PR#10 P2）
+            if let Some(id) = secret_id {
+                sticky_ctx.settle(Some(id), st.is_success());
+            }
             let rh = resp.headers().clone();
             (resp, st, rh, injection_count)
         }
@@ -1841,7 +1903,7 @@ mod tests {
             make_candidate("s3", "*"),
         ];
         let source =
-            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", None);
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", &StickyCtx::observe("acct_1", None));
         match source {
             InjectionSource::MultiSecret {
                 candidates: matched,
@@ -1857,7 +1919,7 @@ mod tests {
     fn injection_source_single_secret_by_path_filter() {
         let candidates = vec![make_candidate("s1", "/v1/*"), make_candidate("s2", "/v2/*")];
         let source =
-            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", None);
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", &StickyCtx::observe("acct_1", None));
         match source {
             InjectionSource::SingleSecret { candidate } => {
                 assert_eq!(candidate.secret_id, "s1");
@@ -1868,7 +1930,7 @@ mod tests {
 
     #[test]
     fn injection_source_fallback_no_candidates() {
-        let source = select_injection_source(&[], "/v1/messages", "acct_1", "api.example.com", None);
+        let source = select_injection_source(&[], "/v1/messages", "acct_1", "api.example.com", &StickyCtx::observe("acct_1", None));
         assert!(matches!(source, InjectionSource::Fallback));
     }
 
@@ -1876,7 +1938,7 @@ mod tests {
     fn injection_source_fallback_path_mismatch() {
         let candidates = vec![make_candidate("s1", "/v2/*"), make_candidate("s2", "/v3/*")];
         let source =
-            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", None);
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", &StickyCtx::observe("acct_1", None));
         assert!(matches!(source, InjectionSource::Fallback));
     }
 
@@ -1888,7 +1950,7 @@ mod tests {
             make_candidate("s2", "/v1/completions"),
         ];
         let source =
-            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", None);
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", &StickyCtx::observe("acct_1", None));
         match source {
             InjectionSource::SingleSecret { candidate } => {
                 assert_eq!(candidate.secret_id, "s1");
@@ -1904,7 +1966,7 @@ mod tests {
         // Each call advances the global offset, but we only verify the
         // returned variant is MultiSecret with correct candidate count.
         for _ in 0..5 {
-            let source = select_injection_source(&candidates, "/v1/x", "acct_wrap", "host.wrap", None);
+            let source = select_injection_source(&candidates, "/v1/x", "acct_wrap", "host.wrap", &StickyCtx::observe("acct_wrap", None));
             match source {
                 InjectionSource::MultiSecret {
                     candidates: matched,
@@ -1918,57 +1980,78 @@ mod tests {
     }
 
     fn sticky_offset(candidates: &[SecretCandidate], acct: &str, session: Option<&str>) -> (usize, &'static str) {
-        match select_injection_source(candidates, "/v1/messages", acct, "api.anthropic.com", session) {
+        let ctx = StickyCtx::observe(acct, session.map(str::to_owned));
+        match select_injection_source(candidates, "/v1/messages", acct, "api.anthropic.com", &ctx) {
             InjectionSource::MultiSecret { candidates: m, offset, sticky } => (offset % m.len(), sticky),
             other => panic!("expected MultiSecret, got {other:?}"),
         }
     }
 
+    /// 一次独立请求：开始看一眼、结束按结果结算
+    fn finish(acct: &str, session: &str, secret: Option<&str>, success: bool) {
+        StickyCtx::observe(acct, Some(session.to_owned())).settle(secret, success);
+    }
+
     #[test]
     fn session_sticky_starts_from_last_success() {
         let c = vec![make_candidate("s1", "*"), make_candidate("s2", "*"), make_candidate("s3", "*")];
-        // 没带会话：照旧轮换
         assert_eq!(sticky_offset(&c, "acct_sticky", None).1, "none");
-        // 带会话但没记过：轮换，标 miss
         assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-a")).1, "miss");
-        // 记下 s3 成功 → 之后从 s3（下标 2）开始，连续多次都不变
-        remember_sticky("acct_sticky", Some("sess-a"), "s3");
+        finish("acct_sticky", "sess-a", Some("s3"), true);
         for _ in 0..5 {
             assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-a")), (2, "hit"));
         }
         // 别的会话、别的 agent 不受影响
         assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-b")).1, "miss");
         assert_eq!(sticky_offset(&c, "acct_other", Some("sess-a")).1, "miss");
-        // 换号成功（例如 s3 被 429 后由 s1 接住）→ 改记 s1
-        remember_sticky("acct_sticky", Some("sess-a"), "s1");
+        // 换号成功（s3 被 429 后由 s1 接住）→ 改记 s1
+        finish("acct_sticky", "sess-a", Some("s1"), true);
         assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-a")), (0, "hit"));
         // 记的号已不在候选里（被解绑）→ 回到轮换
-        remember_sticky("acct_sticky", Some("sess-c"), "gone");
+        finish("acct_sticky", "sess-c", Some("gone"), true);
         assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-c")).1, "miss");
     }
 
     #[test]
     fn session_sticky_forgets_after_failure() {
         let c = vec![make_candidate("s1", "*"), make_candidate("s2", "*")];
-        settle_sticky("acct_fail", Some("sess-f"), "s2", StatusCode::OK);
+        finish("acct_fail", "sess-f", Some("s2"), true);
         assert_eq!(sticky_offset(&c, "acct_fail", Some("sess-f")), (1, "hit"));
-        // 固定号回 403（不触发换号）→ 忘掉，下次回到轮换
-        settle_sticky("acct_fail", Some("sess-f"), "s2", StatusCode::FORBIDDEN);
+        // 403 / 5xx / 网络错误 / 全部冷却都走失败结算 → 忘掉，下次回到轮换
+        finish("acct_fail", "sess-f", Some("s2"), false);
         assert_eq!(sticky_offset(&c, "acct_fail", Some("sess-f")).1, "miss");
-        // 429 用尽、5xx 同理
-        settle_sticky("acct_fail", Some("sess-f"), "s1", StatusCode::OK);
-        settle_sticky("acct_fail", Some("sess-f"), "s1", StatusCode::BAD_GATEWAY);
+        finish("acct_fail", "sess-f", Some("s1"), true);
+        finish("acct_fail", "sess-f", None, false);
         assert_eq!(sticky_offset(&c, "acct_fail", Some("sess-f")).1, "miss");
+    }
+
+    #[test]
+    fn session_sticky_concurrent_requests_do_not_clobber() {
+        let c = vec![make_candidate("s1", "*"), make_candidate("s2", "*")];
+        // 同一会话两个并发首请求：开始时都没有绑定
+        let a = StickyCtx::observe("acct_conc", Some("sess-x".into()));
+        let b = StickyCtx::observe("acct_conc", Some("sess-x".into()));
+        b.settle(Some("s2"), true); // B 先成功，绑定 s2
+        a.settle(Some("s1"), false); // A 迟到的失败：不能删掉 B 刚记的
+        assert_eq!(sticky_offset(&c, "acct_conc", Some("sess-x")), (1, "hit"));
+        let a2 = StickyCtx::observe("acct_conc", Some("sess-y".into()));
+        let b2 = StickyCtx::observe("acct_conc", Some("sess-y".into()));
+        b2.settle(Some("s2"), true);
+        a2.settle(Some("s1"), true); // A 迟到的成功：不覆盖 B 的
+        assert_eq!(sticky_offset(&c, "acct_conc", Some("sess-y")), (1, "hit"));
+        // 都在同一版本上开始的后续请求照常更新
+        finish("acct_conc", "sess-y", Some("s1"), true);
+        assert_eq!(sticky_offset(&c, "acct_conc", Some("sess-y")), (0, "hit"));
     }
 
     #[test]
     fn session_sticky_expires_when_idle() {
         let c = vec![make_candidate("s1", "*"), make_candidate("s2", "*")];
-        remember_sticky("acct_idle", Some("sess-old"), "s2");
+        finish("acct_idle", "sess-old", Some("s2"), true);
         {
             let mut cache = STICKY_SESSIONS.lock().unwrap();
             let e = cache.get_mut(&("acct_idle".to_owned(), "sess-old".to_owned())).unwrap();
-            e.1 = std::time::Instant::now().checked_sub(STICKY_IDLE * 2).unwrap();
+            e.at = std::time::Instant::now().checked_sub(STICKY_IDLE * 2).unwrap();
         }
         assert_eq!(sticky_offset(&c, "acct_idle", Some("sess-old")).1, "miss");
     }
