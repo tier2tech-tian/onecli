@@ -156,6 +156,23 @@ fn sticky_secret(account_id: &str, session: &str) -> Option<String> {
     }
 }
 
+/// 本次最终没成功（401/403/5xx 等非 429 也不会触发换号）→ 忘掉固定号，下次重新轮换，
+/// 免得会话粘死在一个坏号上（以前每请求轮换，坏号只影响一部分请求）
+fn forget_sticky(account_id: &str, session: Option<&str>) {
+    let Some(session) = session else { return };
+    let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.pop(&(account_id.to_owned(), session.to_owned()));
+}
+
+/// 结束时按结果更新：2xx 记下这个号，其他一律忘掉
+fn settle_sticky(account_id: &str, session: Option<&str>, secret_id: &str, status: StatusCode) {
+    if status.is_success() {
+        remember_sticky(account_id, session, secret_id);
+    } else {
+        forget_sticky(account_id, session);
+    }
+}
+
 /// 记下会话这次成功用的号
 fn remember_sticky(account_id: &str, session: Option<&str>, secret_id: &str) {
     let Some(session) = session else { return };
@@ -943,9 +960,7 @@ pub(crate) async fn forward_request(
                 )
                 .await;
                 let st = resp.status();
-                if st.is_success() {
-                    remember_sticky(account_id, session.as_deref(), &candidate.secret_id);
-                }
+                settle_sticky(account_id, session.as_deref(), &candidate.secret_id, st);
                 info!(
                     %request_id, secret_id = %candidate.secret_id,
                     attempt = 1, total = candidates.len(), status = st.as_u16(), session_sticky = sticky,
@@ -1087,9 +1102,7 @@ pub(crate) async fn forward_request(
 
                     // If NOT 429, or this is the last candidate, return this response.
                     if st != StatusCode::TOO_MANY_REQUESTS || i == n - 1 {
-                        if st.is_success() {
-                            remember_sticky(account_id, session.as_deref(), &candidate.secret_id);
-                        }
+                        settle_sticky(account_id, session.as_deref(), &candidate.secret_id, st);
                         if st == StatusCode::TOO_MANY_REQUESTS && i > 0 {
                             warn!(
                                 %request_id,
@@ -1129,6 +1142,7 @@ pub(crate) async fn forward_request(
                 }
 
                 if last_resp.is_none() {
+                    forget_sticky(account_id, session.as_deref());
                     return Ok(super::cooldown::blocked(
                         skipped_until.expect("所有候选均因冷却跳过"),
                         request_id,
@@ -1931,6 +1945,20 @@ mod tests {
         // 记的号已不在候选里（被解绑）→ 回到轮换
         remember_sticky("acct_sticky", Some("sess-c"), "gone");
         assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-c")).1, "miss");
+    }
+
+    #[test]
+    fn session_sticky_forgets_after_failure() {
+        let c = vec![make_candidate("s1", "*"), make_candidate("s2", "*")];
+        settle_sticky("acct_fail", Some("sess-f"), "s2", StatusCode::OK);
+        assert_eq!(sticky_offset(&c, "acct_fail", Some("sess-f")), (1, "hit"));
+        // 固定号回 403（不触发换号）→ 忘掉，下次回到轮换
+        settle_sticky("acct_fail", Some("sess-f"), "s2", StatusCode::FORBIDDEN);
+        assert_eq!(sticky_offset(&c, "acct_fail", Some("sess-f")).1, "miss");
+        // 429 用尽、5xx 同理
+        settle_sticky("acct_fail", Some("sess-f"), "s1", StatusCode::OK);
+        settle_sticky("acct_fail", Some("sess-f"), "s1", StatusCode::BAD_GATEWAY);
+        assert_eq!(sticky_offset(&c, "acct_fail", Some("sess-f")).1, "miss");
     }
 
     #[test]
