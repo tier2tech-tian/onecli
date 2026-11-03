@@ -130,7 +130,7 @@ const STICKY_IDLE: std::time::Duration = std::time::Duration::from_secs(2 * 3600
 /// 每请求换号会 404 再整段重发。按 X-Claude-Code-Session-Id 记 (agent, 会话) → 号，三条规则：
 /// 1. 有绑定且号还在候选里 → 从它开始试（429 / 冷却照原逻辑换下一个）
 /// 2. 最终成功 → 绑到实际成功的号
-/// 3. 最终失败（任何错误，含网络错误）→ 绑定还指向失败的那个号才解绑，下次回到轮换
+/// 3. 号失败（429、冷却中、其他错误、网络错误）→ 绑定还指向这个号才解绑，下次回到轮换
 /// 同会话并发时后成功的覆盖先成功的，最坏多一次整段重发，不另做处理
 static STICKY_SESSIONS: LazyLock<Mutex<LruCache<(String, String), (String, std::time::Instant)>>> =
     LazyLock::new(|| {
@@ -497,6 +497,10 @@ pub(crate) async fn forward_request(
     // 只对 Anthropic 模型请求按会话粘号；其他主机照旧每请求轮换
     // 只对 Anthropic 模型请求按会话粘号；其他主机照旧每请求轮换
     let session = if quota_scoped { session_key(&headers) } else { None };
+    // 规则 3：绑定的号已在冷却 → 解绑，这次从轮换开始（6号 PR#10 三审：否则会反复跳过它、卡在同一个备用号上）
+    for id in locks.keys() {
+        sticky_settle(account_id, session.as_deref(), id, false);
+    }
     let injection_source = select_injection_source(
         &rules.secret_candidates,
         &path,
@@ -1129,6 +1133,8 @@ pub(crate) async fn forward_request(
                     }
 
                     // Got 429 with more candidates — rotate.
+                    // 规则 3：这个号 429 了，绑定还指向它就解绑（后面的号成功会改绑，失败也不会再卡回它）
+                    sticky_settle(account_id, session.as_deref(), &candidate.secret_id, false);
                     info!(
                         %request_id,
                         secret_id = %candidate.secret_id,

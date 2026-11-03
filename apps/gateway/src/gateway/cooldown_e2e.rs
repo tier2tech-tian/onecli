@@ -639,9 +639,10 @@ async fn session_sticky_network_error_and_single_candidate() {
     .execute(&pool)
     .await
     .ok();
-    for id in ["nd", "nb"] {
+    for id in ["nd", "nb", "ma", "mb", "mc"] {
         sqlx::query("INSERT INTO secrets(id) VALUES($1) ON CONFLICT DO NOTHING").bind(id).execute(&pool).await.unwrap();
     }
+    sqlx::query("DELETE FROM secret_cooldowns WHERE secret_id IN ('ma','mb','mc')").execute(&pool).await.unwrap();
     // 上游：nd 收到请求后直接断连接（服务返回错误 → 连接关闭），nb 正常 200
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -659,6 +660,17 @@ async fn session_sticky_network_error_and_single_candidate() {
                         req.into_body().collect().await.unwrap();
                         if auth == "nd" {
                             return Err::<Response<Full<Bytes>>, std::io::Error>(std::io::Error::other("断开"));
+                        }
+                        // ma：5 小时额度用完（429 + 冷却头）；mb：403；其余 200
+                        if auth == "ma" || auth == "mb" {
+                            let reset = time::OffsetDateTime::now_utc().unix_timestamp() + 3600;
+                            return Ok(Response::builder()
+                                .status(if auth == "ma" { 429 } else { 403 })
+                                .header("anthropic-ratelimit-unified-5h-status", "rejected")
+                                .header("anthropic-ratelimit-unified-5h-reset", reset.to_string())
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from("err")))
+                                .unwrap());
                         }
                         Ok(Response::builder()
                             .status(200)
@@ -773,5 +785,20 @@ async fn session_sticky_network_error_and_single_candidate() {
     // 3. 池子扩容成 [nd, nb] 后，会话 W 仍从 nb 开始，不先打 nd
     assert_eq!(send(multi, "W").await, 200);
     assert_eq!(take(), vec!["nb"]);
-    println!("会话粘号 × 网络错误 / 单候选：通过");
+    // 4. 6号 PR#10 三审：固定号 ma 429（进冷却）→ 备用 mb 403 → 之后不能一直卡在 mb，健康的 mc 要能轮到
+    let combo = spawn_proxy(rules_of(&["ma", "mb", "mc"])).await;
+    forward::remember_sticky_for_test(&agent, "Z", "ma");
+    assert_eq!(send(combo, "Z").await, 403);
+    assert_eq!(take(), vec!["ma", "mb"]);
+    assert_eq!(forward::sticky_bound_for_test(&agent, "Z"), None, "429 的固定号要解绑");
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        got.push(send(combo, "Z").await);
+    }
+    assert!(got.contains(&reqwest::StatusCode::OK), "后续请求要能轮到健康的 mc：{got:?}");
+    assert_eq!(forward::sticky_bound_for_test(&agent, "Z").as_deref(), Some("mc"));
+    take();
+    assert_eq!(send(combo, "Z").await, 200);
+    assert_eq!(take(), vec!["mc"], "改绑 mc 后直接用 mc");
+    println!("会话粘号 × 网络错误 / 单候选 / 429→备用失败：通过");
 }
