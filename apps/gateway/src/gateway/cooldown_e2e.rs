@@ -434,3 +434,178 @@ async fn fresh_process_reads_persisted_cooldown() {
     assert!(!locks.contains_key("c"));
     println!("新测试进程读取到未过期周锁，并忽略已过期锁");
 }
+
+/// 会话粘号 × 429（大杰 11-03 要求）：固定的号 429 时照常换下一个，成功后改记新号；冷却中的号直接跳过不打
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "需要专用隔离库 COOLDOWN_TEST_DATABASE_URL"]
+async fn session_sticky_switches_on_429_and_repins() {
+    use super::super::*;
+    use super::*;
+    use crate::{
+        connect::SecretCandidate,
+        inject::{Injection, InjectionRule},
+    };
+    use http_body_util::{BodyExt, Full};
+    use hyper::{
+        body::{Bytes, Incoming},
+        service::service_fn,
+        Request, Response,
+    };
+    use hyper_util::rt::TokioIo;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+    let url = std::env::var("COOLDOWN_TEST_DATABASE_URL").expect("只允许隔离测试库");
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE IF NOT EXISTS secrets(id TEXT PRIMARY KEY);")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../packages/db/prisma/migrations/20261027020000_secret_cooldowns/migration.sql"
+    ))
+    .execute(&pool)
+    .await
+    .ok();
+    for id in ["sa", "sb", "sc"] {
+        sqlx::query("INSERT INTO secrets(id) VALUES($1) ON CONFLICT DO NOTHING")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM secret_cooldowns WHERE secret_id IN ('sa','sb','sc')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 上游：sa 回 429（5 小时额度用完），其余 200
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = up.local_addr().unwrap();
+    let reset = time::OffsetDateTime::now_utc().unix_timestamp() + 3600;
+    let seen_up = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = up.accept().await.unwrap();
+            let seen = seen_up.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let auth = req.headers().get("authorization").unwrap().to_str().unwrap().to_owned();
+                    seen.lock().unwrap().push(auth.clone());
+                    async move {
+                        req.into_body().collect().await.unwrap();
+                        let code = if auth == "sa" { 429 } else { 200 };
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(code)
+                                .header("anthropic-ratelimit-unified-5h-status", if code == 429 { "rejected" } else { "allowed" })
+                                .header("anthropic-ratelimit-unified-5h-reset", reset.to_string())
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(if code == 200 { "ok" } else { "quota" })))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(socket), svc)
+                    .await;
+            });
+        }
+    });
+    let client = reqwest::Client::builder().no_proxy().resolve("api.anthropic.com", up_addr).build().unwrap();
+    let host = format!("api.anthropic.com:{}", up_addr.port());
+    let cache = crate::cache::create_store().await.unwrap();
+    let approvals = crate::approval::create_store().await.unwrap();
+    let candidates: Vec<_> = ["sa", "sb", "sc"]
+        .iter()
+        .map(|id| SecretCandidate {
+            secret_id: id.to_string(),
+            rule: InjectionRule {
+                path_pattern: "*".into(),
+                injections: vec![Injection::SetHeader { name: "authorization".into(), value: id.to_string() }],
+            },
+        })
+        .collect();
+    let rules = Arc::new(mitm::ResolvedRules {
+        injection_rules: vec![],
+        secret_candidates: candidates,
+        policy_rules: vec![],
+        access_restricted: false,
+        intercept_token: None,
+        plan: "free".into(),
+        rewrite_host: None,
+        connection_label: None,
+        finalizer: None,
+        body_transform: None,
+        policy_mode: "allow".into(),
+        claim_token: None,
+        session_policy: None,
+        budget_bindings: vec![],
+    });
+    let agent = uuid::Uuid::new_v4().to_string();
+    let ctx = Arc::new(ProxyContext {
+        project_id: None,
+        organization_id: None,
+        agent_id: Some(agent.clone()),
+        agent_name: None,
+        agent_identifier: None,
+        agent_token: None,
+    });
+    let px = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let px_addr = px.local_addr().unwrap();
+    let pool2 = pool.clone();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = px.accept().await.unwrap();
+            let (rules, ctx, cache, approvals, pool, client, host) =
+                (rules.clone(), ctx.clone(), cache.clone(), approvals.clone(), pool2.clone(), client.clone(), host.clone());
+            tokio::spawn(async move {
+                let svc = service_fn(move |req| {
+                    let (rules, ctx, cache, approvals, pool, client, host) =
+                        (rules.clone(), ctx.clone(), cache.clone(), approvals.clone(), pool.clone(), client.clone(), host.clone());
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            forward::forward_request(req, &host, "http", client, &rules, &*cache, &ctx, &approvals, &pool)
+                                .await
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), svc).await;
+            });
+        }
+    });
+    let send = |session: &'static str| {
+        let px_addr = px_addr;
+        async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(format!("http://{px_addr}/v1/messages"))
+                .header("x-claude-code-session-id", session)
+                .body("x")
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let take = || std::mem::take(&mut *seen.lock().unwrap());
+
+    // 1. 会话 S 原先固定在 sa；sa 这次 429 → 换到 sb 成功
+    forward::remember_sticky_for_test(&agent, "S", "sa");
+    assert_eq!(send("S").await, 200);
+    assert_eq!(take(), vec!["sa", "sb"], "固定的号 429 要照常换下一个");
+    // 2. 同一会话下一轮直接用 sb，不再先打 sa
+    assert_eq!(send("S").await, 200);
+    assert_eq!(take(), vec!["sb"], "成功后改记新号");
+    // 3. 另一个会话也固定在 sa，但 sa 已进冷却 → 直接跳过不打，用下一个
+    forward::remember_sticky_for_test(&agent, "U", "sa");
+    assert_eq!(send("U").await, 200);
+    assert_eq!(take(), vec!["sb"], "冷却中的号不打");
+    // 4. 会话 U 之后固定在 sb
+    assert_eq!(send("U").await, 200);
+    assert_eq!(take(), vec!["sb"]);
+    println!("会话粘号 × 429 / 冷却：通过");
+}

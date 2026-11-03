@@ -121,6 +121,57 @@ static ROTATION_OFFSETS: LazyLock<Mutex<LruCache<(String, String), usize>>> = La
     ))
 });
 
+/// 会话粘号表上限（agent × Claude Code 会话）；超了按最久未用淘汰
+const STICKY_CACHE_CAP: usize = 10_000;
+/// 会话多久没有成功请求就忘掉它用过的号，重新参与轮换
+const STICKY_IDLE: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+/// 会话粘号（大杰 11-03）：Claude Code 增量线程（previous_message_id）的状态存在上一轮服务的那个号上，
+/// 每请求换号会 404 再整段重发。同一会话（X-Claude-Code-Session-Id）优先用上次**成功**的号；
+/// 那个号 429 / 冷却时照旧轮换到下一个，成功后改记新号。(agent, 会话) → (账号, 最后成功时刻)
+static STICKY_SESSIONS: LazyLock<Mutex<LruCache<(String, String), (String, std::time::Instant)>>> =
+    LazyLock::new(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(STICKY_CACHE_CAP).unwrap(),
+        ))
+    });
+
+/// 请求里的 Claude Code 会话编号；不是合理的短 ASCII 串就当没有
+fn session_key(headers: &hyper::HeaderMap) -> Option<String> {
+    let v = headers.get("x-claude-code-session-id")?.to_str().ok()?.trim();
+    (!v.is_empty() && v.len() <= 128 && v.bytes().all(|b| b.is_ascii_graphic())).then(|| v.to_owned())
+}
+
+/// 这个会话上次成功用的号（没过期才算）
+fn sticky_secret(account_id: &str, session: &str) -> Option<String> {
+    let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (account_id.to_owned(), session.to_owned());
+    match cache.get(&key) {
+        Some((secret, at)) if at.elapsed() < STICKY_IDLE => Some(secret.clone()),
+        Some(_) => {
+            cache.pop(&key);
+            None
+        }
+        None => None,
+    }
+}
+
+/// 记下会话这次成功用的号
+fn remember_sticky(account_id: &str, session: Option<&str>, secret_id: &str) {
+    let Some(session) = session else { return };
+    let mut cache = STICKY_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.put(
+        (account_id.to_owned(), session.to_owned()),
+        (secret_id.to_owned(), std::time::Instant::now()),
+    );
+}
+
+/// 测试用：预置某会话已固定的号（端到端测试模拟"之前成功过"）
+#[cfg(test)]
+pub(super) fn remember_sticky_for_test(account_id: &str, session: &str, secret_id: &str) {
+    remember_sticky(account_id, Some(session), secret_id);
+}
+
 /// Injection source selection result for 429 rotation.
 #[derive(Debug)]
 enum InjectionSource<'a> {
@@ -128,6 +179,8 @@ enum InjectionSource<'a> {
     MultiSecret {
         candidates: Vec<&'a SecretCandidate>,
         offset: usize,
+        /// 会话粘号：hit = 从上次成功的号开始；miss = 有会话编号但没记过/已过期；none = 请求没带会话编号
+        sticky: &'static str,
     },
     /// Exactly one secret matches — single-shot, no rotation possible.
     SingleSecret { candidate: &'a SecretCandidate },
@@ -158,6 +211,7 @@ fn select_injection_source<'a>(
     request_path: &str,
     account_id: &str,
     host: &str,
+    session: Option<&str>,
 ) -> InjectionSource<'a> {
     if candidates.is_empty() {
         return InjectionSource::Fallback;
@@ -174,10 +228,19 @@ fn select_injection_source<'a>(
             candidate: matching[0],
         },
         _ => {
-            let offset = get_rotation_offset(account_id, host);
+            // 有会话且上次成功的号还在候选里 → 从它开始；否则照旧轮换（不推进计数器，避免打乱别人）
+            let pinned = session
+                .and_then(|s| sticky_secret(account_id, s))
+                .and_then(|secret| matching.iter().position(|c| c.secret_id == secret));
+            let (offset, sticky) = match (pinned, session) {
+                (Some(i), _) => (i, "hit"),
+                (None, Some(_)) => (get_rotation_offset(account_id, host), "miss"),
+                (None, None) => (get_rotation_offset(account_id, host), "none"),
+            };
             InjectionSource::MultiSecret {
                 candidates: matching,
                 offset,
+                sticky,
             }
         }
     }
@@ -418,16 +481,29 @@ pub(crate) async fn forward_request(
             (None, None, None),
         ));
     }
-    let injection_source =
-        select_injection_source(&rules.secret_candidates, &path, account_id, host);
+    // 只对 Anthropic 模型请求按会话粘号；其他主机照旧每请求轮换
+    let session = if quota_scoped { session_key(&headers) } else { None };
+    let injection_source = select_injection_source(
+        &rules.secret_candidates,
+        &path,
+        account_id,
+        host,
+        session.as_deref(),
+    );
 
     let mut diagnostic_attempts = Vec::new();
     let (rotation_candidates, rotation_start, rotation_reason) = match &injection_source {
-        InjectionSource::MultiSecret { candidates, offset } => (
+        InjectionSource::MultiSecret {
+            candidates,
+            offset,
+            sticky,
+        } => (
             candidates.len(),
             Some(offset % candidates.len()),
             if original_content_length.is_some_and(|n| n > RETRY_BODY_LIMIT) {
                 "content_length_exceeds_retry_limit"
+            } else if *sticky == "hit" {
+                "session_sticky"
             } else {
                 "round_robin"
             },
@@ -758,7 +834,11 @@ pub(crate) async fn forward_request(
 
     // ── Forward to upstream (with optional 429 rotation) ─────────────
     let (upstream_resp, status, resp_headers, injection_count) = match injection_source {
-        InjectionSource::MultiSecret { candidates, offset } => {
+        InjectionSource::MultiSecret {
+            candidates,
+            offset,
+            sticky,
+        } => {
             // Use original_content_length (captured before header filtering strips it).
             // CL > 4MB → single-shot stream, no retry.
             let can_buffer = original_content_length.map_or(true, |cl| cl <= RETRY_BODY_LIMIT);
@@ -863,9 +943,12 @@ pub(crate) async fn forward_request(
                 )
                 .await;
                 let st = resp.status();
+                if st.is_success() {
+                    remember_sticky(account_id, session.as_deref(), &candidate.secret_id);
+                }
                 info!(
                     %request_id, secret_id = %candidate.secret_id,
-                    attempt = 1, total = candidates.len(), status = st.as_u16(),
+                    attempt = 1, total = candidates.len(), status = st.as_u16(), session_sticky = sticky,
                     upstream_request_id = ?resp.headers().get("request-id").and_then(|v| v.to_str().ok()),
                     latency_ms = attempt_start.elapsed().as_millis() as u64,
                     "单次上游请求结束"
@@ -899,7 +982,7 @@ pub(crate) async fn forward_request(
                     %request_id, host, method = %method,
                     original_content_length = ?original_content_length,
                     buffered_body_bytes = body_bytes.len(), retry_body_limit = RETRY_BODY_LIMIT,
-                    total = n, rotation_enabled = true,
+                    total = n, rotation_enabled = true, session_sticky = sticky,
                     "请求已缓冲，启用账号轮换"
                 );
                 let mut last_resp = None;
@@ -1004,6 +1087,9 @@ pub(crate) async fn forward_request(
 
                     // If NOT 429, or this is the last candidate, return this response.
                     if st != StatusCode::TOO_MANY_REQUESTS || i == n - 1 {
+                        if st.is_success() {
+                            remember_sticky(account_id, session.as_deref(), &candidate.secret_id);
+                        }
                         if st == StatusCode::TOO_MANY_REQUESTS && i > 0 {
                             warn!(
                                 %request_id,
@@ -1741,7 +1827,7 @@ mod tests {
             make_candidate("s3", "*"),
         ];
         let source =
-            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", None);
         match source {
             InjectionSource::MultiSecret {
                 candidates: matched,
@@ -1757,7 +1843,7 @@ mod tests {
     fn injection_source_single_secret_by_path_filter() {
         let candidates = vec![make_candidate("s1", "/v1/*"), make_candidate("s2", "/v2/*")];
         let source =
-            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", None);
         match source {
             InjectionSource::SingleSecret { candidate } => {
                 assert_eq!(candidate.secret_id, "s1");
@@ -1768,7 +1854,7 @@ mod tests {
 
     #[test]
     fn injection_source_fallback_no_candidates() {
-        let source = select_injection_source(&[], "/v1/messages", "acct_1", "api.example.com");
+        let source = select_injection_source(&[], "/v1/messages", "acct_1", "api.example.com", None);
         assert!(matches!(source, InjectionSource::Fallback));
     }
 
@@ -1776,7 +1862,7 @@ mod tests {
     fn injection_source_fallback_path_mismatch() {
         let candidates = vec![make_candidate("s1", "/v2/*"), make_candidate("s2", "/v3/*")];
         let source =
-            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", None);
         assert!(matches!(source, InjectionSource::Fallback));
     }
 
@@ -1788,7 +1874,7 @@ mod tests {
             make_candidate("s2", "/v1/completions"),
         ];
         let source =
-            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com");
+            select_injection_source(&candidates, "/v1/messages", "acct_1", "api.example.com", None);
         match source {
             InjectionSource::SingleSecret { candidate } => {
                 assert_eq!(candidate.secret_id, "s1");
@@ -1804,7 +1890,7 @@ mod tests {
         // Each call advances the global offset, but we only verify the
         // returned variant is MultiSecret with correct candidate count.
         for _ in 0..5 {
-            let source = select_injection_source(&candidates, "/v1/x", "acct_wrap", "host.wrap");
+            let source = select_injection_source(&candidates, "/v1/x", "acct_wrap", "host.wrap", None);
             match source {
                 InjectionSource::MultiSecret {
                     candidates: matched,
@@ -1815,6 +1901,60 @@ mod tests {
                 _ => panic!("expected MultiSecret"),
             }
         }
+    }
+
+    fn sticky_offset(candidates: &[SecretCandidate], acct: &str, session: Option<&str>) -> (usize, &'static str) {
+        match select_injection_source(candidates, "/v1/messages", acct, "api.anthropic.com", session) {
+            InjectionSource::MultiSecret { candidates: m, offset, sticky } => (offset % m.len(), sticky),
+            other => panic!("expected MultiSecret, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_sticky_starts_from_last_success() {
+        let c = vec![make_candidate("s1", "*"), make_candidate("s2", "*"), make_candidate("s3", "*")];
+        // 没带会话：照旧轮换
+        assert_eq!(sticky_offset(&c, "acct_sticky", None).1, "none");
+        // 带会话但没记过：轮换，标 miss
+        assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-a")).1, "miss");
+        // 记下 s3 成功 → 之后从 s3（下标 2）开始，连续多次都不变
+        remember_sticky("acct_sticky", Some("sess-a"), "s3");
+        for _ in 0..5 {
+            assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-a")), (2, "hit"));
+        }
+        // 别的会话、别的 agent 不受影响
+        assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-b")).1, "miss");
+        assert_eq!(sticky_offset(&c, "acct_other", Some("sess-a")).1, "miss");
+        // 换号成功（例如 s3 被 429 后由 s1 接住）→ 改记 s1
+        remember_sticky("acct_sticky", Some("sess-a"), "s1");
+        assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-a")), (0, "hit"));
+        // 记的号已不在候选里（被解绑）→ 回到轮换
+        remember_sticky("acct_sticky", Some("sess-c"), "gone");
+        assert_eq!(sticky_offset(&c, "acct_sticky", Some("sess-c")).1, "miss");
+    }
+
+    #[test]
+    fn session_sticky_expires_when_idle() {
+        let c = vec![make_candidate("s1", "*"), make_candidate("s2", "*")];
+        remember_sticky("acct_idle", Some("sess-old"), "s2");
+        {
+            let mut cache = STICKY_SESSIONS.lock().unwrap();
+            let e = cache.get_mut(&("acct_idle".to_owned(), "sess-old".to_owned())).unwrap();
+            e.1 = std::time::Instant::now().checked_sub(STICKY_IDLE * 2).unwrap();
+        }
+        assert_eq!(sticky_offset(&c, "acct_idle", Some("sess-old")).1, "miss");
+    }
+
+    #[test]
+    fn session_key_only_accepts_sane_values() {
+        let mut h = hyper::HeaderMap::new();
+        assert_eq!(session_key(&h), None);
+        h.insert("x-claude-code-session-id", "c1beda3c-0e4f-4b5c-9a0e-1d2f3a4b5c6d".parse().unwrap());
+        assert_eq!(session_key(&h).as_deref(), Some("c1beda3c-0e4f-4b5c-9a0e-1d2f3a4b5c6d"));
+        h.insert("x-claude-code-session-id", "a b".parse().unwrap());
+        assert_eq!(session_key(&h), None);
+        h.insert("x-claude-code-session-id", "x".repeat(200).parse().unwrap());
+        assert_eq!(session_key(&h), None);
     }
 
     #[test]
