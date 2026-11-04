@@ -259,6 +259,51 @@ fn select_injection_source<'a>(
     }
 }
 
+/// 新会话（没粘住号）按额度选起点：快重置又剩得多的号先用（大杰 11-05）；一个号都没额度数据时照旧轮换。返回是否改了起点
+fn apply_quota_pick(
+    source: &mut InjectionSource<'_>,
+    locks: &std::collections::HashMap<String, i64>,
+    now: i64,
+) -> bool {
+    let InjectionSource::MultiSecret { candidates, offset, sticky } = source else {
+        return false;
+    };
+    if *sticky == "hit" {
+        return false;
+    }
+    match quota_pick(candidates, locks, now) {
+        Some(i) => {
+            *offset = i;
+            true
+        }
+        None => false,
+    }
+}
+
+/// 候选里分数最高的号的位置（跳过冷却中的）；一个号都没见过额度数据就返回 None（照旧轮换）
+fn quota_pick(
+    candidates: &[&SecretCandidate],
+    locks: &std::collections::HashMap<String, i64>,
+    now: i64,
+) -> Option<usize> {
+    let ids: Vec<&str> = candidates.iter().map(|c| c.secret_id.as_str()).collect();
+    let latest = super::quota_usage::latest(&ids);
+    if latest.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for (i, l) in latest.into_iter().enumerate() {
+        if locks.contains_key(ids[i]) {
+            continue;
+        }
+        let score = super::quota_usage::pick_score(l, now);
+        if best.map_or(true, |(_, b)| score > b) {
+            best = Some((i, score));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_request(
     req: Request<Incoming>,
@@ -501,13 +546,15 @@ pub(crate) async fn forward_request(
     for id in locks.keys() {
         sticky_settle(account_id, session.as_deref(), id, false);
     }
-    let injection_source = select_injection_source(
+    let mut injection_source = select_injection_source(
         &rules.secret_candidates,
         &path,
         account_id,
         host,
         session.as_deref(),
     );
+    let quota_picked = quota_scoped
+        && apply_quota_pick(&mut injection_source, &locks, time::OffsetDateTime::now_utc().unix_timestamp());
 
     let mut diagnostic_attempts = Vec::new();
     let (rotation_candidates, rotation_start, rotation_reason) = match &injection_source {
@@ -522,6 +569,8 @@ pub(crate) async fn forward_request(
                 "content_length_exceeds_retry_limit"
             } else if *sticky == "hit" {
                 "session_sticky"
+            } else if quota_picked {
+                "quota_pick"
             } else {
                 "round_robin"
             },
@@ -1932,6 +1981,49 @@ mod tests {
                 _ => panic!("expected MultiSecret"),
             }
         }
+    }
+
+    /// 新会话按额度选号（大杰 11-05）：快重置又剩得多的号先用，冷却中的跳过，都没数据时照旧轮换
+    #[test]
+    fn quota_pick_prefers_expiring_leftover() {
+        use super::super::quota_usage::{remember_latest_for_test, Latest};
+        let now = 1_800_000_000;
+        let h = 3600;
+        let c = vec![make_candidate("qp-a", "*"), make_candidate("qp-b", "*"), make_candidate("qp-c", "*"), make_candidate("qp-new", "*")];
+        let refs: Vec<&SecretCandidate> = c.iter().collect();
+        let none = std::collections::HashMap::new();
+        assert_eq!(quota_pick(&refs, &none, now), None, "一个号都没数据 → 照旧轮换");
+        // a：剩 90%，5 天后重置 → 0.0075/h；b：剩 60%，10 小时后重置 → 0.06/h；c：剩 80%，2 小时后重置但 5 小时额度用了 95% → 0.4×0.05=0.02/h
+        remember_latest_for_test("qp-a", Latest { seven_day: Some(0.1), seven_day_reset: Some(now + 120 * h), ..Default::default() });
+        remember_latest_for_test("qp-b", Latest { seven_day: Some(0.4), seven_day_reset: Some(now + 10 * h), ..Default::default() });
+        remember_latest_for_test("qp-c", Latest { seven_day: Some(0.2), seven_day_reset: Some(now + 2 * h),
+            five_hour: Some(0.95), five_hour_reset: Some(now + h) });
+        assert_eq!(quota_pick(&refs, &none, now), Some(1), "选 b");
+        let locked: std::collections::HashMap<String, i64> = [("qp-b".to_owned(), now + h)].into();
+        assert_eq!(quota_pick(&refs, &locked, now), Some(2), "b 冷却中 → 次高的 c");
+        // c 的 5 小时窗口过了 → 5 小时额度按全剩 → 0.4/h 最高
+        assert_eq!(quota_pick(&refs, &none, now + h + 1), Some(2));
+    }
+
+    /// 新会话的起点改成额度最该用的号；已粘住的会话不动
+    #[test]
+    fn apply_quota_pick_only_moves_new_sessions() {
+        use super::super::quota_usage::{remember_latest_for_test, Latest};
+        let now = 1_800_000_000;
+        let c = vec![make_candidate("ap-a", "*"), make_candidate("ap-b", "*")];
+        remember_latest_for_test("ap-a", Latest { seven_day: Some(0.1), seven_day_reset: Some(now + 120 * 3600), ..Default::default() });
+        remember_latest_for_test("ap-b", Latest { seven_day: Some(0.4), seven_day_reset: Some(now + 10 * 3600), ..Default::default() });
+        let none = std::collections::HashMap::new();
+        for state in ["miss", "none"] {
+            let mut src = InjectionSource::MultiSecret { candidates: c.iter().collect(), offset: 0, sticky: state };
+            assert!(apply_quota_pick(&mut src, &none, now));
+            assert!(matches!(src, InjectionSource::MultiSecret { offset: 1, .. }), "{state}: 新会话从 b 开始");
+        }
+        let mut hit = InjectionSource::MultiSecret { candidates: c.iter().collect(), offset: 0, sticky: "hit" };
+        assert!(!apply_quota_pick(&mut hit, &none, now));
+        assert!(matches!(hit, InjectionSource::MultiSecret { offset: 0, .. }), "粘住的会话不动");
+        let mut single = InjectionSource::SingleSecret { candidate: &c[0] };
+        assert!(!apply_quota_pick(&mut single, &none, now));
     }
 
     fn sticky_offset(candidates: &[SecretCandidate], acct: &str, session: Option<&str>) -> (usize, &'static str) {
