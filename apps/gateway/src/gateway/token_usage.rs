@@ -58,6 +58,9 @@ pub(super) struct TokenUsage {
     /// 首字延迟：网关收到请求 → 第一个内容增量（content_block_delta）经过网关，毫秒。
     /// 只有流式回复有；不参与"有没有用量"的判断
     pub ttft_ms: Option<i64>,
+    /// 总用时：网关收到请求 → 回复最后一段数据经过网关，毫秒（11-04：算并发、吞吐要知道每个请求何时结束）。
+    /// 客户端中途断开时是断开前最后一段的时刻；不参与"有没有用量"的判断
+    pub total_ms: Option<i64>,
 }
 
 impl TokenUsage {
@@ -365,6 +368,10 @@ impl Parser {
         }
         if let (Some(start), Some(first)) = (self.start, self.first_content_at) {
             self.usage.ttft_ms = i64::try_from(first.saturating_duration_since(start).as_millis()).ok();
+        }
+        // 最后处理的一段就是回复最后一段数据经过网关的时刻
+        if let (Some(start), Some(last)) = (self.start, self.chunk_at) {
+            self.usage.total_ms = i64::try_from(last.saturating_duration_since(start).as_millis()).ok();
         }
         (!self.usage.is_empty()).then_some(self.usage)
     }
@@ -748,6 +755,7 @@ mod tests {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
             ttft_ms: None,
+            total_ms: None,
         }
     }
 
@@ -800,6 +808,14 @@ mod tests {
             .unwrap();
         // message_start / content_block_start / ping 都不算首字
         assert_eq!(ttft_of(&plain, pos), Some(350));
+        // 总用时 = 最后一段经过网关的时刻
+        let start = Instant::now();
+        let mut p = Parser::new(ident(), Format::Sse);
+        p.start = Some(start);
+        let (a, b) = plain.split_at(pos);
+        p.feed_at(a, start + Duration::from_millis(100));
+        p.feed_at(b, start + Duration::from_millis(350));
+        assert_eq!(p.finish().unwrap().total_ms, Some(350));
         // 首个增量在第一段里 → 第一段的时刻
         assert_eq!(ttft_of(&plain, plain.len() - 1), Some(100));
         // 没有 event 行、只有 data 行的流也认
@@ -892,6 +908,7 @@ mod tests {
                 cache_creation_input_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
                 ttft_ms: None,
+                total_ms: None,
             })
         );
     }
@@ -1135,6 +1152,8 @@ mod wrap_tests {
         // 经过转发侧 Tap 打时间戳 → 旁路线程算出首字延迟（真实时钟，只验有值且不离谱）
         let ttft = t.ttft_ms.expect("流式回复要记首字延迟");
         assert!((0..5_000).contains(&ttft), "ttft={ttft}");
+        let total = t.total_ms.expect("要记总用时");
+        assert!((ttft..5_000).contains(&total), "total={total} ttft={ttft}");
     }
 
     #[tokio::test]
