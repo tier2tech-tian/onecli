@@ -1088,6 +1088,7 @@ mod wrap_tests {
             &resp,
             Some(rid),
             None,
+            None,
         );
         rid
     }
@@ -1377,6 +1378,7 @@ mod channel_tests {
                 ),
                 Some(rid),
                 None,
+                None,
             )
         };
         let mut w = Worker::default();
@@ -1411,6 +1413,7 @@ mod channel_tests {
                     .unwrap(),
             ),
             Some(rid2),
+            None,
             None,
         );
         let ctl = Arc::new(Ctl::default());

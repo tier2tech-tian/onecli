@@ -951,6 +951,7 @@ pub(crate) async fn forward_request(
                     &resp,
                     Some(request_id),
                     proxy_ctx.agent_id.as_deref(),
+                    proxy_ctx.client_user.as_deref(),
                 )
                 .await;
                 let resp = super::diagnostics::record_attempt(
@@ -1084,6 +1085,7 @@ pub(crate) async fn forward_request(
                         &resp,
                         Some(request_id),
                         proxy_ctx.agent_id.as_deref(),
+                        proxy_ctx.client_user.as_deref(),
                     )
                     .await;
                     let resp = super::diagnostics::record_attempt(
@@ -1247,6 +1249,7 @@ pub(crate) async fn forward_request(
                 &resp,
                 Some(request_id),
                 proxy_ctx.agent_id.as_deref(),
+                proxy_ctx.client_user.as_deref(),
             )
             .await;
             let resp = super::diagnostics::record_attempt(

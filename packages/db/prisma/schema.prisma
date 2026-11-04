@@ -606,6 +606,8 @@ model SecretQuotaUsage {
   agentId String? @map("agent_id")
   /// 首字延迟（毫秒）：网关收到请求 → 第一个内容增量经过网关；只有流式回复有
   ttftMs BigInt? @map("ttft_ms")
+  /// 调用方用户 ID：代理用户名带的（CCVM 按人统计）；没带为空
+  clientUser String? @map("client_user")
   secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
   @@index([secretId, observedAt])
   @@index([observedAt])

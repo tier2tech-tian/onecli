@@ -35,11 +35,11 @@ const HOLD_MAX: Duration = Duration::from_secs(30 * 60);
 /// 批量写入：数组展开成多行。账号已被删除的行跳过（不让整批因外键失败）。
 const INSERT: &str = "INSERT INTO secret_quota_usage (secret_id, observed_at, five_hour_utilization, five_hour_reset, \
      seven_day_utilization, seven_day_reset, unified_status, http_status, \
-     model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms) \
+     model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user) \
      SELECT u.* FROM UNNEST($1::text[], $2::bigint[], $3::float8[], $4::bigint[], $5::float8[], $6::bigint[], $7::text[], $8::int4[], \
-       $9::text[], $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[], $14::text[], $15::bigint[]) \
+       $9::text[], $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[], $14::text[], $15::bigint[], $16::text[]) \
        AS u(secret_id, observed_at, five_hour_utilization, five_hour_reset, seven_day_utilization, seven_day_reset, unified_status, http_status, \
-       model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms) \
+       model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user) \
      WHERE EXISTS (SELECT 1 FROM secrets s WHERE s.id = u.secret_id)";
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -99,6 +99,8 @@ pub(super) struct Observation {
     tokens: Option<TokenUsage>,
     /// 发起请求的 agent（= 账号池）；没认出 agent 的请求为 None
     agent_id: Option<String>,
+    /// 代理用户名带的调用方用户 ID（CCVM 按人统计）；没带为 None
+    client_user: Option<String>,
 }
 
 static PENDING: LazyLock<Mutex<VecDeque<Observation>>> =
@@ -209,6 +211,7 @@ pub(super) fn record(
     response: &reqwest::Response,
     request_id: Option<uuid::Uuid>,
     agent_id: Option<&str>,
+    client_user: Option<&str>,
 ) {
     if !super::cooldown::applies(host, path) {
         return;
@@ -226,6 +229,7 @@ pub(super) fn record(
         observed_at: (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
         tokens: None,
         agent_id: agent_id.map(str::to_owned),
+        client_user: client_user.map(str::to_owned),
     };
     // 只有成功回复会原样转发给调用方、正文里才有用量；429 等轮换掉的回复直接入队。
     // 一次转发里成功回复至多一个，所以网关请求编号能唯一对上转发出口的那条回复。
@@ -291,6 +295,7 @@ async fn flush(pool: &PgPool) -> u64 {
                 .bind(tok(|t| t.cache_read_input_tokens))
                 .bind(batch.iter().map(|o| o.agent_id.clone()).collect::<Vec<_>>())
                 .bind(tok(|t| t.ttft_ms))
+                .bind(batch.iter().map(|o| o.client_user.clone()).collect::<Vec<_>>())
                 .execute(pool),
         )
         .await;
@@ -451,6 +456,12 @@ async fn every_response_recorded_in_batches() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../packages/db/prisma/migrations/20261104010000_secret_quota_usage_client_user/migration.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO secrets(id) VALUES('q1'),('q2') ON CONFLICT DO NOTHING")
         .execute(&pool)
         .await
@@ -484,6 +495,7 @@ async fn every_response_recorded_in_batches() {
         &response("0.9"),
         None,
         None,
+        None,
     )
     .await;
     super::cooldown::observe(
@@ -492,6 +504,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.9"),
+        None,
         None,
         None,
     )
@@ -505,6 +518,7 @@ async fn every_response_recorded_in_batches() {
             &response(util),
             None,
             None,
+            None,
         )
         .await;
     }
@@ -514,6 +528,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.3"),
+        None,
         None,
         None,
     )
@@ -556,6 +571,7 @@ async fn every_response_recorded_in_batches() {
             &response("0.4"),
             None,
             None,
+            None,
         )
         .await;
     }
@@ -575,6 +591,7 @@ async fn every_response_recorded_in_batches() {
         &response("0.4"),
         None,
         None,
+        None,
     )
     .await;
     super::cooldown::observe(
@@ -583,6 +600,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.8"),
+        None,
         None,
         None,
     )
@@ -602,6 +620,7 @@ async fn every_response_recorded_in_batches() {
         &response("0.81"),
         None,
         None,
+        None,
     )
     .await;
     super::cooldown::observe(
@@ -610,6 +629,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.82"),
+        None,
         None,
         None,
     )
@@ -626,6 +646,7 @@ async fn every_response_recorded_in_batches() {
         "api.anthropic.com",
         "/v1/messages",
         &response("0.83"),
+        None,
         None,
         None,
     )
@@ -655,6 +676,7 @@ async fn every_response_recorded_in_batches() {
         &ok,
         Some(rid),
         Some("agent-pool-x"),
+        Some("user-1"),
     )
     .await;
     assert_eq!(flush(&pool).await, 0, "等 token 期间不写");
@@ -679,9 +701,10 @@ async fn every_response_recorded_in_batches() {
         Option<i64>,
         Option<String>,
         Option<i64>,
+        Option<String>,
     );
     let row: TokenRow = sqlx::query_as(
-        "SELECT five_hour_utilization, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms \
+        "SELECT five_hour_utilization, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user \
          FROM secret_quota_usage ORDER BY id DESC LIMIT 1",
     )
     .fetch_one(&pool)
@@ -697,7 +720,8 @@ async fn every_response_recorded_in_batches() {
             Some(0),
             Some(4096),
             Some("agent-pool-x".into()),
-            Some(1234)
+            Some(1234),
+            Some("user-1".into())
         )
     );
     let no_agent: (i64,) =
@@ -734,12 +758,14 @@ fn agent_id_follows_observation_through_hold() {
         &resp(429),
         Some(uuid::Uuid::new_v4()),
         Some("pool-a"),
+        None,
     );
     record(
         Some("ag1"),
         "api.anthropic.com",
         "/v1/messages",
         &resp(200),
+        None,
         None,
         None,
     );
@@ -756,6 +782,7 @@ fn agent_id_follows_observation_through_hold() {
         &resp(200),
         Some(rid),
         Some("pool-b"),
+        None,
     );
     assert!(
         drain_agents_for_test("ag2").is_empty(),
@@ -775,6 +802,7 @@ fn agent_id_follows_observation_through_hold() {
         &resp(200),
         Some(rid3),
         Some("pool-c"),
+        None,
     );
     // 只把这一条拨成「已超时」，用正常阈值清理，不碰其他并行测试的暂存
     {
@@ -815,6 +843,7 @@ fn held_until_claimed_or_expired() {
             "/v1/messages",
             &resp(status),
             rid,
+            None,
             None,
         )
     };
@@ -858,6 +887,7 @@ fn queue_is_bounded_and_drops_oldest() {
         observed_at: i,
         tokens: None,
         agent_id: None,
+        client_user: None,
     };
     let mut q: VecDeque<Observation> = VecDeque::new();
     let mut dropped = 0;

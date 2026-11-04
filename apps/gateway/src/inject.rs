@@ -53,12 +53,7 @@ pub(crate) struct InjectionRule {
 /// Extract the agent access token from the `Proxy-Authorization: Basic base64({token}:)` header.
 /// Returns `None` if the header is missing or malformed.
 pub(crate) fn extract_agent_token<T>(req: &Request<T>) -> Option<String> {
-    let value = req.headers().get("proxy-authorization")?.to_str().ok()?;
-    let encoded = value.strip_prefix("Basic ")?.trim();
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .ok()?;
-    let decoded_str = String::from_utf8(decoded).ok()?;
+    let decoded_str = decode_proxy_basic(req)?;
     // Format is "{username}:{token}" — extract the token from the password field.
     // Follows the convention of GitHub/GitLab/Bitbucket: dummy username, token as password.
     // Also handles legacy "{token}:" format (token as username, empty password).
@@ -68,6 +63,27 @@ pub(crate) fn extract_agent_token<T>(req: &Request<T>) -> Option<String> {
         None => &decoded_str,
     };
     Some(token.to_string())
+}
+
+/// 代理用户名里带的调用方用户 ID（CCVM runner 每轮填当前用户，供按人统计用量）。
+/// 只在 `{user}:{token}` 格式下取用户名；占位 `x`、空、或不是 `[A-Za-z0-9_-]{1,64}` 的都当没有。
+pub(crate) fn extract_proxy_user<T>(req: &Request<T>) -> Option<String> {
+    let decoded_str = decode_proxy_basic(req)?;
+    let (user, pass) = decoded_str.split_once(':')?;
+    let valid = !pass.is_empty()
+        && user != "x"
+        && (1..=64).contains(&user.len())
+        && user.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    valid.then(|| user.to_string())
+}
+
+fn decode_proxy_basic<T>(req: &Request<T>) -> Option<String> {
+    let value = req.headers().get("proxy-authorization")?.to_str().ok()?;
+    let encoded = value.strip_prefix("Basic ")?.trim();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    String::from_utf8(decoded).ok()
 }
 
 // ── Injection application ───────────────────────────────────────────────
@@ -339,6 +355,22 @@ mod tests {
         // Convention: dummy username "x", token as password (like GitHub/GitLab)
         let encoded = base64::engine::general_purpose::STANDARD.encode(format!("x:{token}"));
         format!("Basic {encoded}")
+    }
+
+    #[test]
+    fn extract_proxy_user_only_real_ids() {
+        let with = |cred: &str| {
+            let v = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(cred));
+            extract_proxy_user(&request_with_proxy_auth(Some(&v)))
+        };
+        assert_eq!(with("5e996b61-1a2b_c:aoc_tok").as_deref(), Some("5e996b61-1a2b_c"));
+        // 占位 x、旧格式（令牌在用户名）、空用户名、非法字符、超长：都当没带
+        assert_eq!(with("x:aoc_tok"), None);
+        assert_eq!(with("aoc_tok:"), None);
+        assert_eq!(with(":aoc_tok"), None);
+        assert_eq!(with("a b:aoc_tok"), None);
+        assert_eq!(with(&format!("{}:aoc_tok", "a".repeat(65))), None);
+        assert_eq!(extract_proxy_user(&request_with_proxy_auth(None)), None);
     }
 
     #[test]
