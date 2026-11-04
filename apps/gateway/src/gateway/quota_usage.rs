@@ -380,6 +380,38 @@ async fn flush(pool: &PgPool) -> u64 {
     }
 }
 
+/// 启动预读：每个号最近 7 天里最后一次的额度（大杰 11-05）
+const SEED: &str = "SELECT DISTINCT ON (secret_id) secret_id, five_hour_utilization, five_hour_reset, \
+     seven_day_utilization, seven_day_reset FROM secret_quota_usage \
+     WHERE observed_at > $1 AND (seven_day_utilization IS NOT NULL OR five_hour_utilization IS NOT NULL) \
+     ORDER BY secret_id, observed_at DESC";
+
+/// 网关启动时从库里预读每个号最近的额度，填进选号用的内存表，免得重启后要先把没见过的号挨个试一遍才选得准。
+/// 只读这一次；实时回复已经记下的号不覆盖；读失败只打日志，照旧边用边记。
+async fn seed_latest(pool: &PgPool, now: i64) -> usize {
+    let since = (now - 7 * 86400) * 1000;
+    type Row = (String, Option<f64>, Option<i64>, Option<f64>, Option<i64>);
+    match tokio::time::timeout(DB_TIMEOUT, sqlx::query_as::<_, Row>(SEED).bind(since).fetch_all(pool)).await {
+        Ok(Ok(rows)) => {
+            let n = rows.len();
+            let mut map = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+            for (id, five_hour, five_hour_reset, seven_day, seven_day_reset) in rows {
+                map.entry(id).or_insert(Latest { five_hour, five_hour_reset, seven_day, seven_day_reset });
+            }
+            info!(accounts = n, "选号用的账号额度已从库预读");
+            n
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "选号额度预读失败，照旧边用边记");
+            0
+        }
+        Err(_) => {
+            warn!("选号额度预读超时，照旧边用边记");
+            0
+        }
+    }
+}
+
 /// 启动后台写入：独立连接池（最多 1 个连接、懒连接，数据库暂时不可用也不影响网关启动）。只启动一次。
 pub(crate) fn start(database_url: &str) {
     if STARTED.set(()).is_err() {
@@ -398,6 +430,7 @@ pub(crate) fn start(database_url: &str) {
     };
     info!("额度用量记录已启动：每条请求都记（成功回复连同 token 数），每 5 秒批量写库，专用 1 个数据库连接");
     tokio::spawn(async move {
+        seed_latest(&pool, time::OffsetDateTime::now_utc().unix_timestamp()).await;
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -870,6 +903,32 @@ async fn every_response_recorded_in_batches() {
     .await
     .unwrap();
     assert_eq!(empty.0, 7, "之前没带 token 的 7 行，token 列为空");
+
+    // 启动预读（11-05）：每号取 7 天内最后一行；内存里已有的不覆盖；7 天前的不读
+    let now = 1_793_800_000_i64;
+    sqlx::query("INSERT INTO secrets(id) VALUES('seed-a'),('seed-b'),('seed-old') ON CONFLICT DO NOTHING")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (id, at, u7) in [("seed-a", now - 3600, 0.3), ("seed-a", now - 60, 0.4), ("seed-b", now - 60, 0.9), ("seed-old", now - 8 * 86400, 0.5)] {
+        sqlx::query("INSERT INTO secret_quota_usage (secret_id, observed_at, five_hour_utilization, five_hour_reset, seven_day_utilization, seven_day_reset, http_status) VALUES ($1, $2, 0.2, $3, $4, $5, 200)")
+            .bind(id).bind(at * 1000).bind(now + 3600).bind(u7).bind(now + 36000)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let live = Latest { seven_day: Some(0.05), ..Default::default() };
+    remember_latest_for_test("seed-b", live);
+    assert!(seed_latest(&pool, now).await >= 2);
+    assert_eq!(
+        latest(&["seed-a", "seed-b", "seed-old"]),
+        vec![
+            Some(Latest { five_hour: Some(0.2), five_hour_reset: Some(now + 3600), seven_day: Some(0.4), seven_day_reset: Some(now + 36000) }),
+            Some(live),
+            None,
+        ],
+        "a 取最新那行、b 保留实时值、7 天前的不读"
+    );
 }
 
 #[test]
