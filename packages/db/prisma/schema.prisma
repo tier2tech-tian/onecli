@@ -608,6 +608,9 @@ model SecretQuotaUsage {
   ttftMs BigInt? @map("ttft_ms")
   /// 调用方用户 ID：代理用户名带的（CCVM 按人统计）；没带为空
   clientUser String? @map("client_user")
+  /// 7d_oi 档用量与重置（只在 Fable 5 回复上出现，按 Fable 周额度用）；其他回复为空
+  sevenDayOiUtilization Float? @map("seven_day_oi_utilization")
+  sevenDayOiReset BigInt? @map("seven_day_oi_reset")
   secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
   @@index([secretId, observedAt])
   @@index([observedAt])
