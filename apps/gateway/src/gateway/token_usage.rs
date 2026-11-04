@@ -58,6 +58,11 @@ pub(super) struct TokenUsage {
     /// 首字延迟：网关收到请求 → 第一个内容增量（content_block_delta）经过网关，毫秒。
     /// 只有流式回复有；不参与"有没有用量"的判断
     pub ttft_ms: Option<i64>,
+    /// 总用时：网关收到请求 → 回复最后一段数据经过网关，毫秒（11-04：算并发、吞吐要知道每个请求何时结束）。
+    /// 客户端中途断开时是断开前最后一段的时刻；不参与"有没有用量"的判断
+    pub total_ms: Option<i64>,
+    /// 网关收到请求的时刻（毫秒时间戳，墙钟）：开始时刻 + total_ms = 结束时刻，算并发不用再估（大杰 11-04）
+    pub started_at: Option<i64>,
 }
 
 impl TokenUsage {
@@ -365,6 +370,15 @@ impl Parser {
         }
         if let (Some(start), Some(first)) = (self.start, self.first_content_at) {
             self.usage.ttft_ms = i64::try_from(first.saturating_duration_since(start).as_millis()).ok();
+        }
+        // 最后处理的一段就是回复最后一段数据经过网关的时刻
+        if let (Some(start), Some(last)) = (self.start, self.chunk_at) {
+            self.usage.total_ms = i64::try_from(last.saturating_duration_since(start).as_millis()).ok();
+        }
+        // 开始时刻换成墙钟：现在的墙钟减去从开始到现在过了多久（单调时钟）
+        if let Some(start) = self.start {
+            let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+            self.usage.started_at = i64::try_from(start.elapsed().as_millis()).ok().map(|ago| now_ms - ago);
         }
         (!self.usage.is_empty()).then_some(self.usage)
     }
@@ -748,6 +762,8 @@ mod tests {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
             ttft_ms: None,
+            total_ms: None,
+            started_at: None,
         }
     }
 
@@ -800,6 +816,18 @@ mod tests {
             .unwrap();
         // message_start / content_block_start / ping 都不算首字
         assert_eq!(ttft_of(&plain, pos), Some(350));
+        // 总用时 = 最后一段经过网关的时刻
+        let start = Instant::now();
+        let mut p = Parser::new(ident(), Format::Sse);
+        p.start = Some(start);
+        let (a, b) = plain.split_at(pos);
+        p.feed_at(a, start + Duration::from_millis(100));
+        p.feed_at(b, start + Duration::from_millis(350));
+        let wall = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let u = p.finish().unwrap();
+        assert_eq!(u.total_ms, Some(350));
+        let started = u.started_at.expect("要记开始时刻");
+        assert!((wall - started).abs() < 2_000, "开始时刻应接近刚才：started={started} wall={wall}");
         // 首个增量在第一段里 → 第一段的时刻
         assert_eq!(ttft_of(&plain, plain.len() - 1), Some(100));
         // 没有 event 行、只有 data 行的流也认
@@ -814,6 +842,21 @@ mod tests {
             .position(|w| w == b"data: {\"type\":\"content_block_delta\"")
             .unwrap();
         assert_eq!(ttft_of(&data_only, pos), Some(350));
+    }
+
+    #[test]
+    fn started_at_subtracts_elapsed() {
+        // 6号 P2：开始在 60 秒前、最后一段在开始后 350ms → 开始时刻应是 60 秒前，不是 finish 那一刻
+        let plain = gunzip(STREAM_GZ);
+        let start = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let mut p = Parser::new(ident(), Format::Sse);
+        p.start = Some(start);
+        p.feed_at(&plain, start + Duration::from_millis(350));
+        let wall = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let u = p.finish().unwrap();
+        assert_eq!(u.total_ms, Some(350));
+        let ago = wall - u.started_at.unwrap();
+        assert!((59_000..61_000).contains(&ago), "开始时刻应在约 60 秒前：ago={ago}");
     }
 
     #[test]
@@ -892,6 +935,8 @@ mod tests {
                 cache_creation_input_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
                 ttft_ms: None,
+                total_ms: None,
+                started_at: None,
             })
         );
     }
@@ -1135,6 +1180,11 @@ mod wrap_tests {
         // 经过转发侧 Tap 打时间戳 → 旁路线程算出首字延迟（真实时钟，只验有值且不离谱）
         let ttft = t.ttft_ms.expect("流式回复要记首字延迟");
         assert!((0..5_000).contains(&ttft), "ttft={ttft}");
+        let total = t.total_ms.expect("要记总用时");
+        assert!((ttft..5_000).contains(&total), "total={total} ttft={ttft}");
+        let started = t.started_at.expect("要记开始时刻");
+        let wall = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        assert!((0..10_000).contains(&(wall - started)), "开始时刻应在刚才：started={started} wall={wall}");
     }
 
     #[tokio::test]

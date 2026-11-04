@@ -36,12 +36,12 @@ const HOLD_MAX: Duration = Duration::from_secs(30 * 60);
 const INSERT: &str = "INSERT INTO secret_quota_usage (secret_id, observed_at, five_hour_utilization, five_hour_reset, \
      seven_day_utilization, seven_day_reset, unified_status, http_status, \
      model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user, \
-     seven_day_oi_utilization, seven_day_oi_reset) \
+     seven_day_oi_utilization, seven_day_oi_reset, total_ms, started_at) \
      SELECT u.* FROM UNNEST($1::text[], $2::bigint[], $3::float8[], $4::bigint[], $5::float8[], $6::bigint[], $7::text[], $8::int4[], \
-       $9::text[], $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[], $14::text[], $15::bigint[], $16::text[], $17::float8[], $18::bigint[]) \
+       $9::text[], $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[], $14::text[], $15::bigint[], $16::text[], $17::float8[], $18::bigint[], $19::bigint[], $20::bigint[]) \
        AS u(secret_id, observed_at, five_hour_utilization, five_hour_reset, seven_day_utilization, seven_day_reset, unified_status, http_status, \
        model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user, \
-       seven_day_oi_utilization, seven_day_oi_reset) \
+       seven_day_oi_utilization, seven_day_oi_reset, total_ms, started_at) \
      WHERE EXISTS (SELECT 1 FROM secrets s WHERE s.id = u.secret_id)";
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -305,6 +305,8 @@ async fn flush(pool: &PgPool) -> u64 {
                 .bind(batch.iter().map(|o| o.client_user.clone()).collect::<Vec<_>>())
                 .bind(col(|o| o.usage.seven_day_oi_utilization))
                 .bind(coli(|o| o.usage.seven_day_oi_reset))
+                .bind(tok(|t| t.total_ms))
+                .bind(tok(|t| t.started_at))
                 .execute(pool),
         )
         .await;
@@ -491,6 +493,12 @@ async fn every_response_recorded_in_batches() {
     .unwrap();
     sqlx::raw_sql(include_str!(
         "../../../../packages/db/prisma/migrations/20261104030000_secret_quota_usage_7d_oi/migration.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../packages/db/prisma/migrations/20261104060000_secret_quota_usage_total_ms/migration.sql"
     ))
     .execute(&pool)
     .await
@@ -724,6 +732,8 @@ async fn every_response_recorded_in_batches() {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(4096),
             ttft_ms: Some(1234),
+            total_ms: Some(56789),
+            started_at: Some(1793750000123),
         }),
     );
     assert_eq!(flush(&pool).await, 1);
@@ -739,10 +749,11 @@ async fn every_response_recorded_in_batches() {
         Option<String>,
         Option<f64>,
         Option<i64>,
+        Option<i64>,
     );
     let row: TokenRow = sqlx::query_as(
         "SELECT five_hour_utilization, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user, \
-         seven_day_oi_utilization, seven_day_oi_reset \
+         seven_day_oi_utilization, seven_day_oi_reset, total_ms \
          FROM secret_quota_usage ORDER BY id DESC LIMIT 1",
     )
     .fetch_one(&pool)
@@ -761,9 +772,17 @@ async fn every_response_recorded_in_batches() {
             Some(1234),
             Some("user-1".into()),
             Some(0.56),
-            Some(1794002400)
+            Some(1794002400),
+            Some(56789)
         )
     );
+    // 开始时刻单独查（元组超过 12 个没有 PartialEq/Debug）
+    let started: (Option<i64>,) =
+        sqlx::query_as("SELECT started_at FROM secret_quota_usage ORDER BY id DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(started, (Some(1793750000123),));
     let no_agent: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM secret_quota_usage WHERE agent_id IS NULL")
             .fetch_one(&pool)
