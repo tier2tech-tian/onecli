@@ -845,6 +845,21 @@ mod tests {
     }
 
     #[test]
+    fn started_at_subtracts_elapsed() {
+        // 6号 P2：开始在 60 秒前、最后一段在开始后 350ms → 开始时刻应是 60 秒前，不是 finish 那一刻
+        let plain = gunzip(STREAM_GZ);
+        let start = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let mut p = Parser::new(ident(), Format::Sse);
+        p.start = Some(start);
+        p.feed_at(&plain, start + Duration::from_millis(350));
+        let wall = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let u = p.finish().unwrap();
+        assert_eq!(u.total_ms, Some(350));
+        let ago = wall - u.started_at.unwrap();
+        assert!((59_000..61_000).contains(&ago), "开始时刻应在约 60 秒前：ago={ago}");
+    }
+
+    #[test]
     fn ttft_gzip_segment_keeps_its_own_time() {
         // 6号 PR#9 P1 回归：首段（含首个增量）100ms 到，第二段只有 ping、10s 后才到 → 必须记 100
         let plain = gunzip(STREAM_GZ);
