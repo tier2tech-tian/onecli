@@ -35,11 +35,13 @@ const HOLD_MAX: Duration = Duration::from_secs(30 * 60);
 /// 批量写入：数组展开成多行。账号已被删除的行跳过（不让整批因外键失败）。
 const INSERT: &str = "INSERT INTO secret_quota_usage (secret_id, observed_at, five_hour_utilization, five_hour_reset, \
      seven_day_utilization, seven_day_reset, unified_status, http_status, \
-     model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user) \
+     model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user, \
+     seven_day_oi_utilization, seven_day_oi_reset) \
      SELECT u.* FROM UNNEST($1::text[], $2::bigint[], $3::float8[], $4::bigint[], $5::float8[], $6::bigint[], $7::text[], $8::int4[], \
-       $9::text[], $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[], $14::text[], $15::bigint[], $16::text[]) \
+       $9::text[], $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[], $14::text[], $15::bigint[], $16::text[], $17::float8[], $18::bigint[]) \
        AS u(secret_id, observed_at, five_hour_utilization, five_hour_reset, seven_day_utilization, seven_day_reset, unified_status, http_status, \
-       model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user) \
+       model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user, \
+       seven_day_oi_utilization, seven_day_oi_reset) \
      WHERE EXISTS (SELECT 1 FROM secrets s WHERE s.id = u.secret_id)";
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -48,6 +50,9 @@ pub(super) struct QuotaUsage {
     pub five_hour_reset: Option<i64>,
     pub seven_day_utilization: Option<f64>,
     pub seven_day_reset: Option<i64>,
+    /// `7d_oi` 档（11-04 实测只出现在 Fable 5 请求的回复上，按它是 Fable 周额度用）；其他模型的回复没有这档
+    pub seven_day_oi_utilization: Option<f64>,
+    pub seven_day_oi_reset: Option<i64>,
     /// `anthropic-ratelimit-unified-status`（allowed / allowed_warning / rejected）
     pub status: Option<String>,
 }
@@ -80,6 +85,8 @@ pub(super) fn parse(headers: &HeaderMap) -> Option<QuotaUsage> {
         five_hour_reset: reset(headers, "5h"),
         seven_day_utilization: utilization(headers, "7d"),
         seven_day_reset: reset(headers, "7d"),
+        seven_day_oi_utilization: utilization(headers, "7d_oi"),
+        seven_day_oi_reset: reset(headers, "7d_oi"),
         status: header(headers, "status").map(str::to_owned),
     };
     if usage.five_hour_utilization.is_none() && usage.seven_day_utilization.is_none() {
@@ -296,6 +303,8 @@ async fn flush(pool: &PgPool) -> u64 {
                 .bind(batch.iter().map(|o| o.agent_id.clone()).collect::<Vec<_>>())
                 .bind(tok(|t| t.ttft_ms))
                 .bind(batch.iter().map(|o| o.client_user.clone()).collect::<Vec<_>>())
+                .bind(col(|o| o.usage.seven_day_oi_utilization))
+                .bind(coli(|o| o.usage.seven_day_oi_reset))
                 .execute(pool),
         )
         .await;
@@ -380,9 +389,27 @@ mod tests {
                 five_hour_reset: Some(1793142000),
                 seven_day_utilization: Some(0.87),
                 seven_day_reset: Some(1793500000),
+                seven_day_oi_utilization: None,
+                seven_day_oi_reset: None,
                 status: Some("allowed".into()),
             })
         );
+    }
+
+    #[test]
+    fn fable_week_window() {
+        // Fable 5 回复多带一档 7d_oi（11-04 线上实测：rejected 时用量 1.03）
+        let usage = parse(&headers(&[
+            ("5h-utilization", "0.2"),
+            ("7d-utilization", "0.5"),
+            ("7d_oi-utilization", "1.03"),
+            ("7d_oi-reset", "1794002400"),
+        ]))
+        .unwrap();
+        assert_eq!(usage.seven_day_oi_utilization, Some(1.03));
+        assert_eq!(usage.seven_day_oi_reset, Some(1794002400));
+        // 只有 7d_oi、没有 5h/7d 的不单独成行（Fable 回复总带 5h/7d）
+        assert_eq!(parse(&headers(&[("7d_oi-utilization", "0.4")])), None);
     }
 
     #[test]
@@ -458,6 +485,12 @@ async fn every_response_recorded_in_batches() {
     .unwrap();
     sqlx::raw_sql(include_str!(
         "../../../../packages/db/prisma/migrations/20261104010000_secret_quota_usage_client_user/migration.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../packages/db/prisma/migrations/20261104030000_secret_quota_usage_7d_oi/migration.sql"
     ))
     .execute(&pool)
     .await
@@ -665,6 +698,8 @@ async fn every_response_recorded_in_batches() {
         hyper::Response::builder()
             .status(200)
             .header("anthropic-ratelimit-unified-5h-utilization", "0.11")
+            .header("anthropic-ratelimit-unified-7d_oi-utilization", "0.56")
+            .header("anthropic-ratelimit-unified-7d_oi-reset", "1794002400")
             .body(Vec::<u8>::new())
             .unwrap(),
     );
@@ -702,9 +737,12 @@ async fn every_response_recorded_in_batches() {
         Option<String>,
         Option<i64>,
         Option<String>,
+        Option<f64>,
+        Option<i64>,
     );
     let row: TokenRow = sqlx::query_as(
-        "SELECT five_hour_utilization, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user \
+        "SELECT five_hour_utilization, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, agent_id, ttft_ms, client_user, \
+         seven_day_oi_utilization, seven_day_oi_reset \
          FROM secret_quota_usage ORDER BY id DESC LIMIT 1",
     )
     .fetch_one(&pool)
@@ -721,7 +759,9 @@ async fn every_response_recorded_in_batches() {
             Some(4096),
             Some("agent-pool-x".into()),
             Some(1234),
-            Some("user-1".into())
+            Some("user-1".into()),
+            Some(0.56),
+            Some(1794002400)
         )
     );
     let no_agent: (i64,) =
