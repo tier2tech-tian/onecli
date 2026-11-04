@@ -611,7 +611,7 @@ model SecretQuotaUsage {
   /// 7d_oi 档用量与重置（只在 Fable 5 回复上出现，按 Fable 周额度用）；其他回复为空
   sevenDayOiUtilization Float? @map("seven_day_oi_utilization")
   sevenDayOiReset BigInt? @map("seven_day_oi_reset")
-  /// 总用时（毫秒）：网关收到请求 → 回复最后一段经过网关；算并发和吞吐用。老数据、没读完正文的为空
+  /// 总用时（毫秒）：网关收到请求 → 回复最后一段经过网关（中途断开时截至最后一段）；算并发和吞吐用。老数据、没读出 token 的为空
   totalMs BigInt? @map("total_ms")
   secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
   @@index([secretId, observedAt])
