@@ -95,6 +95,54 @@ pub(super) fn parse(headers: &HeaderMap) -> Option<QuotaUsage> {
     Some(usage)
 }
 
+/// 每个号最近一次回复头里的额度，只存内存，给新会话选号用（键是 secret_id，条数 = 号数）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct Latest {
+    pub five_hour: Option<f64>,
+    pub five_hour_reset: Option<i64>,
+    pub seven_day: Option<f64>,
+    pub seven_day_reset: Option<i64>,
+}
+
+static LATEST: LazyLock<Mutex<HashMap<String, Latest>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn remember_latest(id: &str, usage: &QuotaUsage) {
+    let latest = Latest {
+        five_hour: usage.five_hour_utilization,
+        five_hour_reset: usage.five_hour_reset,
+        seven_day: usage.seven_day_utilization,
+        seven_day_reset: usage.seven_day_reset,
+    };
+    LATEST.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_owned(), latest);
+}
+
+/// 这些号各自最近一次的额度（没见过回复的为 None），顺序同 ids
+pub(super) fn latest(ids: &[&str]) -> Vec<Option<Latest>> {
+    let map = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+    ids.iter().map(|id| map.get(*id).copied()).collect()
+}
+
+#[cfg(test)]
+pub(super) fn remember_latest_for_test(id: &str, latest: Latest) {
+    LATEST.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_owned(), latest);
+}
+
+/// 新会话选号分数（大杰 11-05）：周额度剩余 ÷ 离周额度重置还有几小时（不足 1 小时按 1）× 5 小时额度剩余。
+/// 越高越先用：快重置又剩得多的号先用掉，免得额度作废；5 小时额度快满的号往后排，免得新会话扎堆撞 429。
+/// 周额度已过重置时刻按全剩、7 天算；5 小时额度已过重置时刻按全剩算；没见过回复的号同"全剩、7 天"。
+pub(super) fn pick_score(latest: Option<Latest>, now: i64) -> f64 {
+    let l = latest.unwrap_or_default();
+    let (left, hours) = match l.seven_day_reset {
+        Some(r) if r > now => ((1.0 - l.seven_day.unwrap_or(0.0)).max(0.0), ((r - now) as f64 / 3600.0).max(1.0)),
+        _ => (1.0, 168.0),
+    };
+    let five_left = match l.five_hour_reset {
+        Some(r) if r > now => (1.0 - l.five_hour.unwrap_or(0.0)).max(0.0),
+        _ => 1.0,
+    };
+    left / hours * five_left
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Observation {
     secret_id: String,
@@ -229,6 +277,7 @@ pub(super) fn record(
     let Some(usage) = parse(response.headers()) else {
         return;
     };
+    remember_latest(id, &usage);
     let obs = Observation {
         secret_id: id.to_owned(),
         usage,
@@ -362,6 +411,31 @@ pub(crate) fn start(database_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_score_spends_expiring_quota_first() {
+        let now = 1_800_000_000;
+        let h = 3600;
+        let soon = Latest { seven_day: Some(0.4), seven_day_reset: Some(now + 10 * h), ..Default::default() };
+        let later = Latest { seven_day: Some(0.1), seven_day_reset: Some(now + 120 * h), ..Default::default() };
+        assert!((pick_score(Some(soon), now) - 0.06).abs() < 1e-9);
+        assert!((pick_score(Some(later), now) - 0.0075).abs() < 1e-9);
+        // 不足 1 小时按 1 小时；用超（>1）按 0
+        let minute = Latest { seven_day: Some(0.5), seven_day_reset: Some(now + 60), ..Default::default() };
+        assert!((pick_score(Some(minute), now) - 0.5).abs() < 1e-9);
+        let over = Latest { seven_day: Some(1.03), seven_day_reset: Some(now + h), ..Default::default() };
+        assert_eq!(pick_score(Some(over), now), 0.0);
+        // 周额度已过重置 / 没见过 → 全剩、7 天
+        let stale = Latest { seven_day: Some(0.9), seven_day_reset: Some(now - 1), ..Default::default() };
+        assert!((pick_score(Some(stale), now) - 1.0 / 168.0).abs() < 1e-9);
+        assert!((pick_score(None, now) - 1.0 / 168.0).abs() < 1e-9);
+        // 5 小时额度快满往后排，过了 5 小时重置不再扣
+        let busy = Latest { five_hour: Some(0.75), five_hour_reset: Some(now + h), ..soon };
+        assert!((pick_score(Some(busy), now) - 0.015).abs() < 1e-9);
+        let busy_reset = Latest { five_hour_reset: Some(now - 1), ..busy };
+        assert!((pick_score(Some(busy_reset), now) - 0.06).abs() < 1e-9);
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
