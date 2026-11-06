@@ -20,7 +20,7 @@ async fn real_forwarding_persists_attempt_chain() {
         ("exhausted", vec![429, 429, 429], 3, 3),
         ("stop_other_error", vec![429, 401], 3, 3),
         ("single", vec![403], 1, 3),
-        ("oversized", vec![429], 3, 4 * 1024 * 1024 + 1),
+        ("oversized", vec![429], 3, 32 * 1024 * 1024 + 1),
         ("transport_after_429", vec![429, 0], 2, 3),
     ] {
         let seen = Arc::new(AtomicUsize::new(0));

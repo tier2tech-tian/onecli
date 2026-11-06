@@ -34,6 +34,59 @@ pub(super) fn parse(headers: &HeaderMap, now: i64) -> Result<Option<QuotaLock>, 
     Ok(None)
 }
 
+/// Fable 周额度单独用完（7d_oi 被拒、5 小时和普通周额度都还在）→ 到 7d_oi 重置时刻为止
+pub(super) fn parse_fable(headers: &HeaderMap, now: i64) -> Option<i64> {
+    let status = |w: &str| {
+        headers
+            .get(format!("anthropic-ratelimit-unified-{w}-status"))
+            .and_then(|v| v.to_str().ok())
+    };
+    if status("7d_oi") != Some("rejected") || status("5h") == Some("rejected") || status("7d") == Some("rejected") {
+        return None;
+    }
+    headers
+        .get("anthropic-ratelimit-unified-7d_oi-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v > now)
+}
+
+/// Fable 冷却（大杰 11-07：Fable 满了照普通账号的逻辑冷却换号，只拦 Fable 请求、不影响这个号用别的模型）。
+/// 只放内存：网关重启丢了也只是多撞一次 429 再记上
+static FABLE_LOCKS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, i64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn fable_locks() -> std::sync::MutexGuard<'static, HashMap<String, i64>> {
+    FABLE_LOCKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 记 Fable 冷却：同一个号取更晚的重置时刻
+pub(super) fn lock_fable(id: &str, until: i64) {
+    let mut locks = fable_locks();
+    let v = locks.entry(id.to_owned()).or_insert(until);
+    *v = (*v).max(until);
+}
+
+/// 这个号的 Fable 冷却到什么时候；没冷却或已过期为 None
+pub(super) fn fable_locked(id: &str, now: i64) -> Option<i64> {
+    fable_locks().get(id).copied().filter(|&until| until > now)
+}
+
+/// 请求体是不是 Fable 模型：找顶层 "model" 键（字符串里的引号都转义成 \"，不会误中），只看前 64KB
+pub(super) fn is_fable_request(body: &[u8]) -> bool {
+    let head = &body[..body.len().min(64 * 1024)];
+    let Some(pos) = head.windows(7).position(|w| w == b"\"model\"") else {
+        return false;
+    };
+    let rest = head[pos + 7..].iter().skip_while(|b| b.is_ascii_whitespace());
+    let mut rest = rest.skip_while(|&&b| b == b':').skip_while(|b| b.is_ascii_whitespace());
+    if rest.next() != Some(&b'"') {
+        return false;
+    }
+    let value: Vec<u8> = rest.take_while(|&&b| b != b'"').copied().collect();
+    value.starts_with(b"claude-fable")
+}
+
 pub(super) fn beijing(until: i64) -> String {
     let t = time::OffsetDateTime::from_unix_timestamp(until)
         .unwrap()
@@ -88,6 +141,11 @@ pub(super) async fn observe(
         return;
     };
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    if let Some(until) = parse_fable(response.headers(), now) {
+        lock_fable(id, until);
+        info!(secret_id = id, reason = "fable_week", reset_at = until, reset_beijing = %beijing(until), "Fable 冷却已更新（只拦 Fable 请求）");
+        return;
+    }
     let lock = match parse(response.headers(), now) {
         Ok(Some(v)) => v,
         Ok(None) => return,
@@ -233,6 +291,43 @@ mod tests {
     #[test]
     fn timestamp_display_is_beijing() {
         assert_eq!(beijing(1793142000), "2026-10-28 07:00:00+08:00");
+    }
+    fn oi(h5: &str, d7: &str, oi: &str, reset: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in [("5h-status", h5), ("7d-status", d7), ("7d_oi-status", oi), ("7d_oi-reset", reset)] {
+            h.insert(
+                hyper::header::HeaderName::from_bytes(format!("anthropic-ratelimit-unified-{k}").as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+    #[test]
+    fn fable_week_only() {
+        // 11-06 09:02 线上那条：5h / 7d allowed，7d_oi rejected
+        assert_eq!(parse_fable(&oi("allowed", "allowed", "rejected", "300"), 100), Some(300));
+        assert_eq!(parse(&oi("allowed", "allowed", "rejected", "300"), 100), Ok(None), "普通冷却不认这条");
+        // 普通额度也满了 → 交给普通冷却，不另记 Fable
+        assert_eq!(parse_fable(&oi("rejected", "allowed", "rejected", "300"), 100), None);
+        assert_eq!(parse_fable(&oi("allowed", "allowed", "allowed", "300"), 100), None);
+        assert_eq!(parse_fable(&oi("allowed", "allowed", "rejected", "99"), 100), None, "重置时间已过");
+    }
+    #[test]
+    fn fable_lock_keeps_later_reset() {
+        lock_fable("unit-fable", 500);
+        lock_fable("unit-fable", 300);
+        assert_eq!(fable_locked("unit-fable", 100), Some(500));
+        assert_eq!(fable_locked("unit-fable", 600), None, "过期自动失效");
+        assert_eq!(fable_locked("unit-other", 100), None);
+    }
+    #[test]
+    fn fable_request_by_model() {
+        assert!(is_fable_request(br#"{"model":"claude-fable-5-1","messages":[]}"#));
+        assert!(is_fable_request(br#"{ "model" : "claude-fable-5-1" }"#));
+        assert!(!is_fable_request(br#"{"model":"claude-sonnet-5-5","messages":[]}"#));
+        // 内容里提到 "model" 是转义过的引号，不会误认
+        assert!(!is_fable_request(br#"{"messages":[{"content":"\"model\":\"claude-fable-5-1\""}],"model":"claude-sonnet-5-5"}"#));
+        assert!(!is_fable_request(b"x"));
     }
     #[test]
     fn only_model_endpoint() {

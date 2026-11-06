@@ -107,7 +107,8 @@ const AUTH_CHECK_BODY_LIMIT: usize = 8192;
 const MAX_DEFAULT_INTERCEPT_BODY: usize = 64 * 1024;
 
 /// Maximum request body size eligible for 429 retry buffering (4 MB).
-const RETRY_BODY_LIMIT: u64 = 4 * 1024 * 1024;
+/// 能换号重发的请求体上限（11-07 从 4MB 提到 32MB：长会话的请求常超 4MB，24 小时最大 23.6MB；只在请求进行中占内存）
+const RETRY_BODY_LIMIT: u64 = 32 * 1024 * 1024;
 
 /// Number of (account_id, host) rotation offsets to keep in memory.
 const ROTATION_CACHE_CAP: usize = 1024;
@@ -907,7 +908,7 @@ pub(crate) async fn forward_request(
             sticky,
         } => {
             // Use original_content_length (captured before header filtering strips it).
-            // CL > 4MB → single-shot stream, no retry.
+            // CL > RETRY_BODY_LIMIT → single-shot stream, no retry.
             let can_buffer = original_content_length.map_or(true, |cl| cl <= RETRY_BODY_LIMIT);
 
             if !can_buffer {
@@ -1025,7 +1026,7 @@ pub(crate) async fn forward_request(
                 (resp, st, rh, real_count)
             } else {
                 // Buffer the body with a hard limit. Reads frame-by-frame
-                // and stops as soon as the cumulative size exceeds 4MB.
+                // and stops as soon as the cumulative size exceeds RETRY_BODY_LIMIT.
                 let body_bytes = match read_body_with_limit(forward_body, RETRY_BODY_LIMIT).await {
                     Ok(bytes) => bytes,
                     Err(_) => {
@@ -1039,7 +1040,7 @@ pub(crate) async fn forward_request(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             serde_json::json!({
                                 "error": "request_too_large",
-                                "message": "Request body exceeds 4MB retry limit"
+                                "message": "Request body exceeds 32MB retry limit"
                             }),
                         ));
                     }
@@ -1059,6 +1060,8 @@ pub(crate) async fn forward_request(
                 let mut real_injection_count = 0;
 
                 let mut skipped_until: Option<i64> = None;
+                // Fable 请求另外跳过 Fable 周额度用完的号（照普通冷却换号；别的模型照常用这些号）
+                let fable = quota_scoped && super::cooldown::is_fable_request(&body_bytes);
                 for i in 0..n {
                     let idx = (offset + i) % n;
                     let candidate = candidates[idx];
@@ -1068,8 +1071,12 @@ pub(crate) async fn forward_request(
                             std::slice::from_ref(&candidate.secret_id),
                         )
                         .await;
-                        if let Some(&until) = current.get(&candidate.secret_id) {
+                        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                        let fable_until = if fable { super::cooldown::fable_locked(&candidate.secret_id, now) } else { None };
+                        if let Some(until) = current.get(&candidate.secret_id).copied().or(fable_until) {
                             skipped_until = Some(skipped_until.map_or(until, |v| v.min(until)));
+                            // 会话固定在这个号上就解绑，免得每轮都先跳它
+                            sticky_settle(account_id, session.as_deref(), &candidate.secret_id, false);
                             continue;
                         }
                     }
