@@ -34,6 +34,9 @@ pub(crate) const SECRET_MODE_SELECTIVE: &str = "selective";
 pub(crate) struct SecretCandidate {
     pub secret_id: String,
     pub rule: InjectionRule,
+    /// 账号 metadata.egress 指定的出口名；None = 默认出口（见 gateway::egress）
+    #[serde(default)]
+    pub egress: Option<String>,
 }
 
 /// Result of policy resolution for a CONNECT request.
@@ -353,6 +356,7 @@ impl PolicyEngine {
             secret_candidates.push(SecretCandidate {
                 secret_id: secret.id.clone(),
                 rule: rule.clone(),
+                egress: crate::gateway::egress::from_metadata(secret.metadata.as_ref()),
             });
 
             rules.push(rule);

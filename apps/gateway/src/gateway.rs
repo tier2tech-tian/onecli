@@ -19,6 +19,9 @@ mod body;
 mod cloud_response;
 mod cooldown;
 mod diagnostics;
+pub(crate) mod egress;
+#[cfg(test)]
+mod egress_e2e;
 #[cfg(test)]
 mod diagnostics_e2e;
 mod finalizers;
@@ -87,6 +90,8 @@ pub(crate) struct GatewayState {
     /// No-verify upstream client — skips TLS certificate validation.
     /// Selected for hosts matched by `skip_verify_hosts`.
     pub http_client_no_verify: reqwest::Client,
+    /// 按账号分出口的上游连接（GATEWAY_EGRESS_PROXIES）；没标出口的号用上面两个默认连接
+    pub egress: Arc<egress::EgressRegistry>,
     /// Hostname patterns for which TLS certificate validation is skipped.
     /// Supports exact match (`internal.corp`) and wildcard prefix (`*.internal.corp`).
     /// Populated from `GATEWAY_SKIP_VERIFY_HOSTS` (comma-separated).
@@ -177,6 +182,7 @@ impl GatewayServer {
             ca: Arc::new(ca),
             http_client: build_http_client(global_skip),
             http_client_no_verify: build_http_client(true),
+            egress: Arc::new(egress::EgressRegistry::from_env(global_skip)),
             skip_verify_hosts,
             danger_accept_invalid_certs: global_skip,
             policy_engine,
@@ -196,6 +202,7 @@ impl GatewayServer {
             .context("binding TCP listener")?;
 
         info!(addr = %addr, "listening for connections");
+        self.state.egress.spawn_probe();
 
         // CORS configuration for browser → gateway requests.
         // credentials: true requires explicit headers/methods (not wildcard *).
@@ -710,6 +717,7 @@ async fn handle_connect(
                             &host,
                             &ca,
                             http_client,
+                            Arc::clone(&state.egress),
                             vault_injection_rules,
                             cache,
                             proxy_ctx,
@@ -904,6 +912,7 @@ async fn handle_http_proxy(
             &authority,
             scheme,
             http_client,
+            &state.egress,
             &rules,
             &*state.cache,
             &proxy_ctx,
