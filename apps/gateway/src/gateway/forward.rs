@@ -1020,7 +1020,7 @@ pub(crate) async fn forward_request(
                     .inspect_err(|error| {
                         // 网络错误也算失败（规则 3）；走专用出口的，整组号先停用等探测恢复
                         sticky_settle(account_id, session.as_deref(), &candidate.secret_id, false);
-                        egress.mark_down(candidate.egress.as_deref());
+                        egress.on_send_error(candidate.egress.as_deref(), error);
                         super::diagnostics::record_transport_error(
                             error,
                             request_id,
@@ -1165,7 +1165,7 @@ pub(crate) async fn forward_request(
                         .inspect_err(|error| {
                             // 网络错误也算失败（规则 3）；走专用出口的，整组号先停用等探测恢复
                             sticky_settle(account_id, session.as_deref(), &candidate.secret_id, false);
-                            egress.mark_down(candidate.egress.as_deref());
+                            egress.on_send_error(candidate.egress.as_deref(), error);
                             super::diagnostics::record_transport_error(
                                 error,
                                 request_id,
@@ -1341,7 +1341,7 @@ pub(crate) async fn forward_request(
                     if let Some(id) = secret_id {
                         sticky_settle(account_id, session.as_deref(), id, false);
                     }
-                    egress.mark_down(single.and_then(|c| c.egress.as_deref()));
+                    egress.on_send_error(single.and_then(|c| c.egress.as_deref()), error);
                     super::diagnostics::record_transport_error(
                         error,
                         request_id,

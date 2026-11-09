@@ -322,6 +322,14 @@ impl PolicyEngine {
                     .and_then(|v| v.as_str())
                     == Some("oauth");
 
+            let egress = crate::gateway::egress::from_metadata(secret.metadata.as_ref());
+            // 指定出口的号刷新凭据也必须走同一出口；刷新目前只走默认连接，所以这类组合直接不启用
+            // （6号 PR#17 P1-2；Claude 号是长期令牌，不走这里）
+            if is_openai_oauth && egress.is_some() {
+                warn!(secret_id = %secret.id, egress = ?egress, "OAuth 账号指定了出口，刷新无法走该出口，跳过此账号");
+                continue;
+            }
+
             let effective_value = if is_openai_oauth {
                 match secret_inject::refresh_openai_oauth_if_expired(
                     &self.crypto,
@@ -356,7 +364,7 @@ impl PolicyEngine {
             secret_candidates.push(SecretCandidate {
                 secret_id: secret.id.clone(),
                 rule: rule.clone(),
-                egress: crate::gateway::egress::from_metadata(secret.metadata.as_ref()),
+                egress,
             });
 
             rules.push(rule);

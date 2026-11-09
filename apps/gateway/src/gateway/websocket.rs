@@ -101,6 +101,19 @@ pub(super) async fn handle_websocket(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
+    // 按账号分出口：WebSocket 直连上游、不经出口代理。规则里只要有指定出口的号就拒绝，
+    // 免得这些号的凭据绕过专用出口发出去（6号 PR#17 P1-1；本轮不实现 WebSocket 走代理）
+    if rules.secret_candidates.iter().any(|c| c.egress.is_some()) {
+        warn!(host = %host, path = %path, "WebSocket 请求涉及指定出口的账号，网关不支持，已拒绝");
+        return Ok(response::json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "error": "egress_unsupported",
+                "message": "OneCLI gateway: WebSocket is not supported for accounts bound to a dedicated egress route.",
+            }),
+        ));
+    }
+
     let agent_token = proxy_ctx.agent_token.as_deref().unwrap_or("");
     let has_injections = !rules.injection_rules.is_empty();
     let enforce_deny = has_injections && !policy::is_llm_host(host);

@@ -15,7 +15,11 @@ type Seen = Arc<Mutex<Vec<String>>>;
 
 /// 起一个 HTTP 服务：记下 "名字:authorization"，按 authorization 决定状态码（含 "429" 的回 429）
 async fn spawn_recorder(name: &'static str, seen: Seen) -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    spawn_recorder_at("127.0.0.1:0", name, seen).await
+}
+
+async fn spawn_recorder_at(bind: &str, name: &'static str, seen: Seen) -> std::net::SocketAddr {
+    let listener = TcpListener::bind(bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
@@ -280,22 +284,127 @@ async fn transport_error_pauses_egress_until_probe_recovers() {
     let (st, _) = send(&direct.to_string(), registry.clone(), one, 3).await;
     assert_eq!(st, 503);
 
-    // 探测：代理不通保持停用；换成能通的探测地址后恢复
+    // 探测：代理不通保持停用
     registry.probe_for_test("http://example.invalid/ip").await;
     assert!(matches!(
         registry.pick(Some("kr")),
         egress::EgressPick::Unavailable { .. }
     ));
-    let kr_ok = spawn_recorder("kr", seen.clone()).await;
-    let healthy = egress::EgressRegistry::for_test(&[("kr", &format!("http://{kr_ok}"))], false);
-    healthy.probe_for_test("http://probe.test/ip").await;
+    // 同一个出口地址恢复（在原端口起代理）→ 同一份清单探测成功后放行，业务请求只经出口代理（6号 PR#17 建议）
+    spawn_recorder_at(&dead.to_string(), "kr", seen.clone()).await;
+    registry.probe_for_test("http://probe.test/ip").await;
     assert!(matches!(
-        healthy.pick(Some("kr")),
+        registry.pick(Some("kr")),
         egress::EgressPick::Route(_)
     ));
     assert_eq!(
-        seen.lock().unwrap().as_slice(),
-        ["kr:-"],
+        std::mem::take(&mut *seen.lock().unwrap()),
+        vec!["kr:-"],
         "探测请求必须经出口代理发出"
     );
+    let (st, body) = send(
+        &direct.to_string(),
+        registry.clone(),
+        vec![candidate("k1", "Bearer kr-1", Some("kr"))],
+        3,
+    )
+    .await;
+    assert_eq!((st, body.as_str()), (200, "kr 3"));
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["kr:Bearer kr-1"],
+        "恢复后直连上游仍零请求"
+    );
+}
+
+/// 6号 PR#17 P1-1 回归：WebSocket 直连上游不经出口代理，规则里有指定出口的号就必须拒绝、一个字节都不发上游
+#[tokio::test]
+async fn websocket_with_tagged_secret_is_rejected_before_connecting() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_upstream = accepted.clone();
+    let upstream_task = tokio::spawn(async move {
+        while upstream.accept().await.is_ok() {
+            accepted_upstream.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let tagged = candidate("fake-kr", "Bearer FAKE_KR_WS", Some("kr"));
+    let rules = Arc::new(mitm::ResolvedRules {
+        injection_rules: vec![tagged.rule.clone()],
+        secret_candidates: vec![tagged],
+        policy_rules: vec![],
+        access_restricted: false,
+        intercept_token: None,
+        plan: "free".into(),
+        rewrite_host: None,
+        connection_label: None,
+        finalizer: None,
+        body_transform: None,
+        policy_mode: "allow".into(),
+        claim_token: None,
+        session_policy: None,
+        budget_bindings: vec![],
+    });
+    let ctx = Arc::new(ProxyContext {
+        project_id: None,
+        organization_id: None,
+        agent_id: Some(format!("ws-{}", uuid::Uuid::new_v4())),
+        agent_name: None,
+        agent_identifier: None,
+        agent_token: None,
+        client_user: None,
+    });
+    let cache = crate::cache::create_store().await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/unused")
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = listener.local_addr().unwrap();
+    let front_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let svc = service_fn(move |req| {
+            let (rules, ctx, cache, pool) =
+                (rules.clone(), ctx.clone(), cache.clone(), pool.clone());
+            async move {
+                assert!(websocket::is_websocket_upgrade(&req));
+                let resp = websocket::handle_websocket(
+                    req,
+                    &upstream_addr.to_string(),
+                    &rules,
+                    &*cache,
+                    &pool,
+                    &ctx,
+                    true,
+                )
+                .await
+                .unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(socket), svc)
+            .with_upgrades()
+            .await;
+    });
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{front}/v1/messages"))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    assert!(resp.text().await.unwrap().contains("egress_unsupported"));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 0, "上游不得收到任何连接");
+    front_task.abort();
+    upstream_task.abort();
 }

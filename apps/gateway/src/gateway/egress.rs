@@ -46,13 +46,21 @@ pub(crate) enum EgressPick<'a> {
     },
 }
 
-/// 账号 metadata 里的出口名（去空白、转小写；没写或空串 = 默认出口）
+/// 配错类型的出口名：清单里永远没有它，这个号按 unknown 不可用（不静默落到默认出口，6号 PR#17 P2-1）
+const INVALID_EGRESS: &str = "<invalid>";
+
+/// 账号 metadata 里的出口名（去空白、转小写；没写、null 或空串 = 默认出口；不是字符串 = 配置错误、不可用）
 pub(crate) fn from_metadata(metadata: Option<&serde_json::Value>) -> Option<String> {
-    metadata
-        .and_then(|m| m.get("egress"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
+    match metadata.and_then(|m| m.get("egress")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => {
+            Some(s.trim().to_lowercase()).filter(|s| !s.is_empty())
+        }
+        Some(other) => {
+            warn!(value = %other, "账号 metadata.egress 不是字符串，按配置错误处理，该账号不可用");
+            Some(INVALID_EGRESS.to_string())
+        }
+    }
 }
 
 /// 解析 `名字=代理地址` 列表；坏条目记日志跳过（对应的号会因 unknown 不可用，不影响其他号）
@@ -129,8 +137,16 @@ impl EgressRegistry {
         }
     }
 
-    /// 经这个出口转发出现网络错误：整组号先停用，等下一次探测成功再放行
-    pub(crate) fn mark_down(&self, egress: Option<&str>) {
+    /// 经出口转发失败：只有连不上（代理或经代理建连失败）才判出口不通、整组停用；
+    /// 请求体/构造等错误不算出口故障（6号 PR#17 P2-2）
+    pub(crate) fn on_send_error(&self, egress: Option<&str>, error: &reqwest::Error) {
+        if error.is_connect() {
+            self.mark_down(egress);
+        }
+    }
+
+    /// 整组号先停用，等下一次探测成功再放行
+    fn mark_down(&self, egress: Option<&str>) {
         if let Some(route) = egress.and_then(|name| self.routes.get(name)) {
             if route.up.swap(false, Ordering::Relaxed) {
                 warn!(
@@ -212,7 +228,21 @@ mod tests {
             from_metadata(Some(&serde_json::json!({"egress": ""}))),
             None
         );
-        assert_eq!(from_metadata(Some(&serde_json::json!({"egress": 1}))), None);
+        assert_eq!(
+            from_metadata(Some(&serde_json::json!({"egress": null}))),
+            None
+        );
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!(["kr"]),
+            serde_json::json!({"n": "kr"}),
+        ] {
+            assert_eq!(
+                from_metadata(Some(&serde_json::json!({ "egress": bad }))).as_deref(),
+                Some(INVALID_EGRESS),
+                "类型错误不得当成默认出口"
+            );
+        }
         assert_eq!(from_metadata(Some(&serde_json::json!({}))), None);
         assert_eq!(from_metadata(None), None);
     }
