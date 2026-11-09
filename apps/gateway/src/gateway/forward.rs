@@ -26,6 +26,7 @@ use crate::default_interceptions;
 use crate::inject;
 use crate::policy::{self, PolicyDecision};
 
+use super::egress::{EgressPick, EgressRegistry};
 use super::hooks;
 use super::mitm::ResolvedRules;
 use super::response;
@@ -305,12 +306,45 @@ fn quota_pick(
     best.map(|(i, _)| i)
 }
 
+/// 这个号这次用哪个上游连接：没标出口用默认连接；标了出口就只用该出口，出口不可用返回 None（绝不回落默认连接）
+fn upstream_for<'c>(
+    default: &'c reqwest::Client,
+    egress: &'c EgressRegistry,
+    candidate: &SecretCandidate,
+    request_id: uuid::Uuid,
+) -> Option<&'c reqwest::Client> {
+    match egress.pick(candidate.egress.as_deref()) {
+        EgressPick::Default => Some(default),
+        EgressPick::Route(client) => Some(client),
+        EgressPick::Unavailable { egress, reason } => {
+            warn!(%request_id, secret_id = %candidate.secret_id, %egress, reason, "账号出口不可用，本次跳过这个号");
+            None
+        }
+    }
+}
+
+/// 候选号全因出口不可用被跳过：返回 503，客户端会退避重试；不改走别的出口
+fn egress_unavailable(request_id: uuid::Uuid) -> Response<hooks::ForwardResponseBody> {
+    warn!(%request_id, "候选账号的出口都不可用，返回 503");
+    let mut resp = response::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        serde_json::json!({
+            "error": "egress_unavailable",
+            "message": "OneCLI gateway: the egress route for these accounts is temporarily unavailable.",
+        }),
+    );
+    resp.headers_mut()
+        .insert("retry-after", hyper::header::HeaderValue::from_static("15"));
+    resp
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_request(
     req: Request<Incoming>,
     host: &str,
     scheme: &str,
     http_client: reqwest::Client,
+    egress: &EgressRegistry,
     rules: &ResolvedRules,
     cache: &dyn CacheStore,
     proxy_ctx: &ProxyContext,
@@ -918,10 +952,21 @@ pub(crate) async fn forward_request(
                 } else {
                     std::collections::HashMap::new()
                 };
-                let candidate = (0..candidates.len())
+                let mut egress_skipped = false;
+                let picked = (0..candidates.len())
                     .map(|i| candidates[(offset + i) % candidates.len()])
-                    .find(|c| !current.contains_key(&c.secret_id));
-                let Some(candidate) = candidate else {
+                    .filter(|c| !current.contains_key(&c.secret_id))
+                    .find_map(|c| match upstream_for(&http_client, egress, c, request_id) {
+                        Some(client) => Some((c, client)),
+                        None => {
+                            egress_skipped = true;
+                            None
+                        }
+                    });
+                let Some((candidate, client)) = picked else {
+                    if egress_skipped {
+                        return Ok(egress_unavailable(request_id));
+                    }
                     return Ok(super::cooldown::blocked(
                         *current.values().min().unwrap(),
                         request_id,
@@ -964,7 +1009,7 @@ pub(crate) async fn forward_request(
                 )
                 .await?;
                 let retry_url = format!("{scheme}://{host}{retry_path}");
-                let mut req_builder = http_client.request(method.clone(), &retry_url);
+                let mut req_builder = client.request(method.clone(), &retry_url);
                 for (name, value) in retry_headers.iter() {
                     req_builder = req_builder.header(name.clone(), value.clone());
                 }
@@ -973,8 +1018,9 @@ pub(crate) async fn forward_request(
                     .send()
                     .await
                     .inspect_err(|error| {
-                        // 网络错误也算失败（规则 3）
+                        // 网络错误也算失败（规则 3）；走专用出口的，整组号先停用等探测恢复
                         sticky_settle(account_id, session.as_deref(), &candidate.secret_id, false);
+                        egress.on_send_error(candidate.egress.as_deref(), error);
                         super::diagnostics::record_transport_error(
                             error,
                             request_id,
@@ -1060,6 +1106,7 @@ pub(crate) async fn forward_request(
                 let mut real_injection_count = 0;
 
                 let mut skipped_until: Option<i64> = None;
+                let mut egress_skipped = false;
                 // Fable 请求另外跳过 Fable 周额度用完的号（照普通冷却换号；别的模型照常用这些号）
                 let fable = quota_scoped && super::cooldown::is_fable_request(&body_bytes);
                 for i in 0..n {
@@ -1080,6 +1127,10 @@ pub(crate) async fn forward_request(
                             continue;
                         }
                     }
+                    let Some(client) = upstream_for(&http_client, egress, candidate, request_id) else {
+                        egress_skipped = true;
+                        continue;
+                    };
                     let attempt_start = std::time::Instant::now();
 
                     let mut retry_headers = headers.clone();
@@ -1102,7 +1153,7 @@ pub(crate) async fn forward_request(
                     .await?;
                     let retry_url = format!("{scheme}://{host}{retry_path}");
 
-                    let mut req_builder = http_client.request(method.clone(), &retry_url);
+                    let mut req_builder = client.request(method.clone(), &retry_url);
                     for (name, value) in retry_headers.iter() {
                         req_builder = req_builder.header(name.clone(), value.clone());
                     }
@@ -1112,8 +1163,9 @@ pub(crate) async fn forward_request(
                         .send()
                         .await
                         .inspect_err(|error| {
-                            // 网络错误也算失败（规则 3）
+                            // 网络错误也算失败（规则 3）；走专用出口的，整组号先停用等探测恢复
                             sticky_settle(account_id, session.as_deref(), &candidate.secret_id, false);
+                            egress.on_send_error(candidate.egress.as_deref(), error);
                             super::diagnostics::record_transport_error(
                                 error,
                                 request_id,
@@ -1207,8 +1259,12 @@ pub(crate) async fn forward_request(
                 }
 
                 if last_resp.is_none() {
+                    // 有号因出口不可用被跳过 → 503 让客户端稍后重试；全是额度冷却 → 照旧 429
+                    let Some(until) = skipped_until.filter(|_| !egress_skipped) else {
+                        return Ok(egress_unavailable(request_id));
+                    };
                     return Ok(super::cooldown::blocked(
-                        skipped_until.expect("所有候选均因冷却跳过"),
+                        until,
                         request_id,
                         proxy_ctx,
                         host,
@@ -1232,12 +1288,11 @@ pub(crate) async fn forward_request(
         }
         source => {
             // SingleSecret or Fallback — normal single-shot path.
-            let (secret_id, reason) = match source {
-                InjectionSource::SingleSecret { candidate } => {
-                    (Some(candidate.secret_id.as_str()), "single_candidate")
-                }
+            let (single, reason) = match source {
+                InjectionSource::SingleSecret { candidate } => (Some(candidate), "single_candidate"),
                 _ => (None, "no_secret_candidates"),
             };
+            let secret_id = single.map(|c| c.secret_id.as_str());
             info!(
                 %request_id, host, method = %method,
                 original_content_length = ?original_content_length,
@@ -1265,7 +1320,14 @@ pub(crate) async fn forward_request(
                     }
                 }
             }
-            let mut req_builder = http_client.request(method.clone(), &upstream_url);
+            let client = match single {
+                Some(candidate) => match upstream_for(&http_client, egress, candidate, request_id) {
+                    Some(client) => client,
+                    None => return Ok(egress_unavailable(request_id)),
+                },
+                None => &http_client,
+            };
+            let mut req_builder = client.request(method.clone(), &upstream_url);
             for (name, value) in headers.iter() {
                 req_builder = req_builder.header(name.clone(), value.clone());
             }
@@ -1275,10 +1337,11 @@ pub(crate) async fn forward_request(
                 .send()
                 .await
                 .inspect_err(|error| {
-                    // 网络错误也算失败（规则 3）
+                    // 网络错误也算失败（规则 3）；走专用出口的，整组号先停用等探测恢复
                     if let Some(id) = secret_id {
                         sticky_settle(account_id, session.as_deref(), id, false);
                     }
+                    egress.on_send_error(single.and_then(|c| c.egress.as_deref()), error);
                     super::diagnostics::record_transport_error(
                         error,
                         request_id,
@@ -1903,6 +1966,7 @@ mod tests {
                     value: format!("key-{secret_id}"),
                 }],
             },
+            egress: None,
         }
     }
 

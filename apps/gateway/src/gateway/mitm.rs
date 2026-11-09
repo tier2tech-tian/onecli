@@ -46,6 +46,7 @@ pub(super) async fn mitm(
     host: &str,
     ca: &CertificateAuthority,
     http_client: reqwest::Client,
+    egress: Arc<super::egress::EgressRegistry>,
     vault_injection_rules: Vec<InjectionRule>,
     cache: Arc<dyn CacheStore>,
     proxy_ctx: Arc<ProxyContext>,
@@ -77,6 +78,7 @@ pub(super) async fn mitm(
             service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let host = host_owned.clone();
                 let client = http_client.clone();
+                let egress = Arc::clone(&egress);
                 let cache = Arc::clone(&cache);
                 let ctx = Arc::clone(&proxy_ctx);
                 let approvals = Arc::clone(&approval_store);
@@ -136,6 +138,7 @@ pub(super) async fn mitm(
                                     effective_host,
                                     "https",
                                     client,
+                                    &egress,
                                     &rules,
                                     &*cache,
                                     &ctx,

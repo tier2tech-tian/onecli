@@ -148,6 +148,7 @@ async fn persisted_locks_and_http_forwarding() {
                         value: id.to_string(),
                     }],
                 },
+                egress: None,
             })
             .collect();
         // 故意把锁定账号放在旧规则末尾，检测单候选注入绕过。
@@ -199,7 +200,7 @@ async fn persisted_locks_and_http_forwarding() {
                 async move {
                     Ok::<_, std::convert::Infallible>(
                         forward::forward_request(
-                            req, &host, "http", client, &rules, &*cache, &ctx, &approvals, &pool,
+                            req, &host, "http", client, &crate::gateway::egress::EgressRegistry::default(), &rules, &*cache, &ctx, &approvals, &pool,
                         )
                         .await
                         .unwrap(),
@@ -533,6 +534,7 @@ async fn session_sticky_switches_on_429_and_repins() {
                 path_pattern: "*".into(),
                 injections: vec![Injection::SetHeader { name: "authorization".into(), value: id.to_string() }],
             },
+            egress: None,
         })
         .collect();
     let rules = Arc::new(mitm::ResolvedRules {
@@ -575,7 +577,7 @@ async fn session_sticky_switches_on_429_and_repins() {
                         (rules.clone(), ctx.clone(), cache.clone(), approvals.clone(), pool.clone(), client.clone(), host.clone());
                     async move {
                         Ok::<_, std::convert::Infallible>(
-                            forward::forward_request(req, &host, "http", client, &rules, &*cache, &ctx, &approvals, &pool)
+                            forward::forward_request(req, &host, "http", client, &crate::gateway::egress::EgressRegistry::default(), &rules, &*cache, &ctx, &approvals, &pool)
                                 .await
                                 .unwrap(),
                         )
@@ -713,6 +715,7 @@ async fn fable_week_locks_only_fable_requests() {
                 path_pattern: "*".into(),
                 injections: vec![Injection::SetHeader { name: "authorization".into(), value: id.to_string() }],
             },
+            egress: None,
         })
         .collect();
     let rules = Arc::new(mitm::ResolvedRules {
@@ -755,7 +758,7 @@ async fn fable_week_locks_only_fable_requests() {
                         (rules.clone(), ctx.clone(), cache.clone(), approvals.clone(), pool.clone(), client.clone(), host.clone());
                     async move {
                         Ok::<_, std::convert::Infallible>(
-                            forward::forward_request(req, &host, "http", client, &rules, &*cache, &ctx, &approvals, &pool)
+                            forward::forward_request(req, &host, "http", client, &crate::gateway::egress::EgressRegistry::default(), &rules, &*cache, &ctx, &approvals, &pool)
                                 .await
                                 .unwrap(),
                         )
@@ -891,6 +894,7 @@ async fn session_sticky_network_error_and_single_candidate() {
                         path_pattern: "*".into(),
                         injections: vec![Injection::SetHeader { name: "authorization".into(), value: id.to_string() }],
                     },
+                    egress: None,
                 })
                 .collect(),
             policy_rules: vec![],
@@ -933,7 +937,7 @@ async fn session_sticky_network_error_and_single_candidate() {
                             let (rules, ctx, cache, approvals, pool, client, host) =
                                 (rules.clone(), ctx.clone(), cache.clone(), approvals.clone(), pool.clone(), client.clone(), host.clone());
                             async move {
-                                match forward::forward_request(req, &host, "http", client, &rules, &*cache, &ctx, &approvals, &pool).await {
+                                match forward::forward_request(req, &host, "http", client, &crate::gateway::egress::EgressRegistry::default(), &rules, &*cache, &ctx, &approvals, &pool).await {
                                     Ok(r) => Ok::<_, std::convert::Infallible>(r.map(http_body_util::Either::Left)),
                                     Err(_) => Ok(Response::builder()
                                         .status(502)

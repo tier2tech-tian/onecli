@@ -94,6 +94,7 @@ async fn real_forwarding_persists_attempt_chain() {
                         value: format!("Bearer mock-secret-{i}"),
                     }],
                 },
+                egress: None,
             })
             .collect();
         let rules = Arc::new(mitm::ResolvedRules {
@@ -143,6 +144,7 @@ async fn real_forwarding_persists_attempt_chain() {
                             &host,
                             "http",
                             reqwest::Client::new(),
+                            &egress::EgressRegistry::default(),
                             &rules,
                             &*cache,
                             &ctx,
