@@ -70,6 +70,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # LRU cache (429 rotation offset)
 lru = "0.12"
 
+# IP/CIDR matching (NO_PROXY)
+ipnet = "2"
+
 # Error handling
 anyhow = "1"
 
